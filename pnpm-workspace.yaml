@@ -1,0 +1,13 @@
+packages:
+  - apps/*
+  - packages/*
+  - services/*
+
+allowBuilds:
+  esbuild: true
+  protobufjs: true
+
+managePackageManagerVersions: false
+
+overrides:
+  ws: 8.21.1

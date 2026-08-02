@@ -1,0 +1,25 @@
+{
+  "name": "@signbridge/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 4173",
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc -b --pretty false",
+    "test": "vitest run --configLoader runner"
+  },
+  "dependencies": {
+    "@signbridge/contracts": "workspace:*",
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.2",
+    "@vitejs/plugin-react": "6.0.1",
+    "typescript": "6.0.2",
+    "vite": "8.0.10",
+    "vitest": "4.1.6"
+  }
+}

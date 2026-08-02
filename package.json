@@ -1,0 +1,33 @@
+{
+  "name": "signbridge-reception",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A bounded, captions-first reception aid that retrieves Deaf-reviewed ASL phrase videos.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@11.18.0",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --filter @signbridge/web --filter @signbridge/api dev",
+    "dev:web": "pnpm --filter @signbridge/web dev",
+    "dev:api": "pnpm --filter @signbridge/api dev",
+    "build": "pnpm --filter @signbridge/contracts build && pnpm --filter @signbridge/web build && pnpm --filter @signbridge/api build",
+    "typecheck": "pnpm --filter @signbridge/contracts build && pnpm --filter @signbridge/web typecheck && pnpm --filter @signbridge/api typecheck",
+    "test": "pnpm test:unit",
+    "test:unit": "pnpm --filter @signbridge/contracts build && vitest run --configLoader runner",
+    "test:e2e": "playwright test",
+    "catalog:verify": "node scripts/verify-catalog.mjs",
+    "verify:line-endings": "node scripts/verify-line-endings.mjs",
+    "verify:no-secrets": "node scripts/verify-no-secrets.mjs",
+    "verify": "pnpm verify:line-endings && pnpm verify:no-secrets && pnpm typecheck && pnpm test:unit && pnpm catalog:verify && pnpm build"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.12.1",
+    "@playwright/test": "1.61.0",
+    "typescript": "6.0.2",
+    "vite": "8.0.10",
+    "vitest": "4.1.6"
+  }
+}

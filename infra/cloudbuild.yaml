@@ -1,0 +1,51 @@
+substitutions:
+  _REGION: us-central1
+  _SERVICE: signbridge-reception-staging
+  _IMAGE: signbridge-reception
+  _ARTIFACT_REPOSITORY: signbridge
+  _SIGN_ASSET_BUCKET: change-me-private-sign-assets
+  _PILOT_SITE_ID: demo-reception
+  _APP_ORIGIN: https://change-me.example
+  _SIGN_CATALOG_PATH: /workspace/content/catalog/catalog.v1.draft.json
+  _SCHEDULER_SERVICE_ACCOUNT: signbridge-scheduler@${PROJECT_ID}.iam.gserviceaccount.com
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --file
+      - infra/Dockerfile
+      - --tag
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REPOSITORY}/${_IMAGE}:${COMMIT_SHA}
+      - .
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REPOSITORY}/${_IMAGE}:${COMMIT_SHA}
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REPOSITORY}/${_IMAGE}:${COMMIT_SHA}
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+      - --service-account=signbridge-runtime@${PROJECT_ID}.iam.gserviceaccount.com
+      - --cpu=1
+      - --memory=1Gi
+      - --concurrency=10
+      - --min-instances=0
+      - --max-instances=1
+      - --timeout=300
+      - --session-affinity
+      - --set-env-vars=USE_GOOGLE_CLOUD=true,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=global,GOOGLE_SPEECH_LOCATION=global,GOOGLE_SPEECH_RECOGNIZER=_,GOOGLE_SPEECH_MODEL=chirp_3,GEMINI_MODEL=gemini-3.6-flash,SIGN_ASSET_BUCKET=${_SIGN_ASSET_BUCKET},SIGN_CATALOG_PATH=${_SIGN_CATALOG_PATH},FIRESTORE_DATABASE=(default),EVENT_RETENTION_DAYS=30,PILOT_SITE_ID=${_PILOT_SITE_ID},APP_ORIGIN=${_APP_ORIGIN},INTERNAL_OIDC_AUDIENCE=${_APP_ORIGIN},INTERNAL_OIDC_SERVICE_ACCOUNT=${_SCHEDULER_SERVICE_ACCOUNT},DEPLOYMENT_SHA=${COMMIT_SHA}
+      - --set-secrets=SESSION_SECRET=signbridge-session-secret:latest,PILOT_SITE_CODE=signbridge-site-code:latest,ADMIN_ACCESS_CODE=signbridge-admin-code:latest
+
+images:
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REPOSITORY}/${_IMAGE}:${COMMIT_SHA}
+
+options:
+  dynamicSubstitutions: true
+  logging: CLOUD_LOGGING_ONLY
