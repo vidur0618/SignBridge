@@ -188,7 +188,7 @@ p, h1, h2, h3 { margin-top: 0; }
 .scope-note p { margin: .28rem 0 0; color: #725349; font-size: .74rem; line-height: 1.5; }
 .mode-fieldset { margin: 0 0 1.2rem; padding: 0; border: 0; }
 .mode-fieldset legend { margin-bottom: .6rem; font-size: .76rem; font-weight: 830; }
-.segmented-control { display: grid; grid-template-columns: 1fr 1fr; gap: .65rem; }
+.segmented-control { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .65rem; }
 .segmented-control label { position: relative; display: grid; grid-template-columns: auto 1fr; gap: .65rem; align-items: center; min-height: 4.4rem; padding: .85rem; border: 1px solid var(--line); border-radius: .85rem; background: rgb(255 255 255 / 55%); }
 .segmented-control label.selected { border-color: var(--blue); background: var(--blue-soft); box-shadow: inset 0 0 0 1px var(--blue); }
 .segmented-control input { position: absolute; opacity: 0; }
@@ -197,6 +197,12 @@ p, h1, h2, h3 { margin-top: 0; }
 .segmented-control label > span { display: grid; gap: .15rem; }
 .segmented-control strong { font-size: .78rem; }
 .segmented-control small { color: var(--muted); font-size: .67rem; }
+.avatar-activation { display: grid; gap: .75rem; margin: -.35rem 0 1.2rem; padding: 1rem; border: 1px solid #d9c585; border-radius: .9rem; background: var(--amber-soft); }
+.avatar-activation h2 { margin: .15rem 0 0; font-size: .95rem; }
+.avatar-activation label { display: grid; grid-template-columns: auto 1fr; gap: .65rem; align-items: start; color: #574524; font-size: .72rem; line-height: 1.5; }
+.avatar-activation input { width: 1.05rem; height: 1.05rem; margin-top: .12rem; accent-color: var(--blue); }
+.avatar-activation .secondary-button { justify-self: start; }
+.avatar-activation .microcopy { margin: 0; color: #654d1c; }
 
 .input-card { border: 1px solid var(--line); border-radius: 1.2rem; background: var(--paper); box-shadow: var(--shadow-sm); overflow: hidden; }
 .card-heading { display: flex; align-items: center; justify-content: space-between; padding: 1.25rem 1.3rem .85rem; }
@@ -258,7 +264,7 @@ p, h1, h2, h3 { margin-top: 0; }
 .state-badge.listening { background: var(--coral-soft); color: #9a3c27; }
 .state-badge.listening > span { background: var(--coral); animation: pulse 1.2s infinite; }
 .state-badge.candidate { background: var(--amber-soft); color: #7c5000; }
-.state-badge.candidate > span { background: #bf7800; }
+.state-badge.candidate > span, .state-badge.avatar_confirmation > span { background: #bf7800; }
 .state-badge.playing { background: var(--teal-soft); color: #07625a; }
 .visitor-stage { min-height: 30rem; display: grid; border: 1px solid #283640; border-radius: 1.35rem; overflow: hidden; background: var(--night); color: white; box-shadow: var(--shadow-lg); }
 .empty-stage { display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 30rem; padding: 2rem; text-align: center; }
@@ -301,6 +307,23 @@ p, h1, h2, h3 { margin-top: 0; }
 .video-actions button { display: inline-flex; align-items: center; gap: .35rem; min-height: 2.2rem; padding: .4rem .65rem; border: 0; border-radius: .45rem; background: transparent; color: #e5ecef; font-size: .68rem; font-weight: 780; }
 .video-actions button:hover { background: #263741; }
 .video-actions > span { margin-left: auto; padding: .3rem .5rem; border: 1px solid #41515b; border-radius: .35rem; color: #afbdc4; font-size: .65rem; }
+.avatar-stage { position: relative; min-height: 30rem; display: grid; grid-template-rows: auto minmax(18rem, 1fr) auto auto; background: #071219; }
+.avatar-label > span { color: #e1d4ff; }
+.handtalk-avatar { position: relative; min-width: 0; min-height: 18rem; overflow: hidden; background: radial-gradient(circle at 50% 30%, #e6f4ef, #cdded9 70%, #afc4be); color: #10231f; }
+.handtalk-avatar-host { position: relative; width: 100%; height: 100%; min-height: 18rem; overflow: hidden; }
+.handtalk-avatar-host > * { max-width: 100% !important; max-height: 100% !important; }
+.avatar-status { position: absolute; z-index: 4; right: .75rem; bottom: .75rem; display: inline-flex; align-items: center; gap: .4rem; padding: .4rem .6rem; border: 1px solid rgb(16 35 31 / 18%); border-radius: 99px; background: rgb(255 255 255 / 88%); color: #214b43; font-size: .62rem; font-weight: 800; backdrop-filter: blur(8px); }
+.avatar-status .status-dot { width: .45rem; height: .45rem; border-radius: 50%; background: var(--teal); }
+.state-loading .avatar-status .status-dot { background: #b37100; animation: pulse 1.2s infinite; }
+.state-error .avatar-status .status-dot, .state-unavailable .avatar-status .status-dot { background: var(--red); }
+.avatar-ready-copy { position: absolute; z-index: 3; top: 42%; right: 1rem; left: 1rem; display: grid; gap: .3rem; justify-items: center; color: #214b43; text-align: center; pointer-events: none; }
+.avatar-ready-copy strong { font-size: 1rem; }
+.avatar-ready-copy span { font-size: .7rem; }
+.avatar-actions { justify-content: flex-start; }
+.avatar-actions label { margin-left: auto; }
+.avatar-actions select { min-height: 2.2rem; padding: .35rem 1.8rem .35rem .55rem; border: 1px solid #41515b; border-radius: .4rem; background: #172730; color: #e5ecef; font-size: .68rem; }
+.video-actions button:disabled { opacity: .42; cursor: not-allowed; }
+.sr-only { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
 .feedback-panel { margin-top: .5rem; }
 .feedback-form { display: grid; grid-template-columns: 1fr 1fr; gap: .7rem; margin-top: .5rem; padding: .9rem; border: 1px solid var(--line); border-radius: .75rem; background: var(--paper); }
 .feedback-form label { display: grid; gap: .3rem; font-size: .67rem; font-weight: 800; }
@@ -357,7 +380,7 @@ p, h1, h2, h3 { margin-top: 0; }
   .workspace { grid-template-columns: 1fr; max-width: 53rem; }
   .display-column { grid-row: 1; }
   .operator-column { grid-row: 2; }
-  .visitor-stage, .empty-stage, .caption-stage { min-height: 25rem; }
+  .visitor-stage, .empty-stage, .caption-stage, .avatar-stage { min-height: 25rem; }
   .metrics-grid { grid-template-columns: repeat(2, 1fr); }
 }
 
@@ -373,7 +396,7 @@ p, h1, h2, h3 { margin-top: 0; }
   .header-actions .connection-badge { display: none; }
   .demo-ribbon { justify-content: start; flex-wrap: wrap; padding: .6rem 1rem; }
   .workspace { padding-top: 1.5rem; gap: 1.5rem; }
-  .visitor-stage, .empty-stage, .caption-stage { min-height: 22rem; }
+  .visitor-stage, .empty-stage, .caption-stage, .avatar-stage { min-height: 22rem; }
   .final-caption p { font-size: clamp(2rem, 10vw, 3.6rem); }
   .segmented-control { grid-template-columns: 1fr; }
   .input-tabs button > span small { display: none; }
@@ -402,7 +425,7 @@ p, h1, h2, h3 { margin-top: 0; }
   .input-panel { padding: .8rem; }
   .speak-panel { grid-template-columns: 1fr; justify-items: center; text-align: center; }
   .mic-orbit { width: 3.6rem; height: 3.6rem; }
-  .visitor-stage, .empty-stage, .caption-stage { min-height: 20rem; border-radius: 1rem; }
+  .visitor-stage, .empty-stage, .caption-stage, .avatar-stage { min-height: 20rem; border-radius: 1rem; }
   .caption-stage { padding: 1.35rem; }
   .stage-watermark { max-width: 8rem; white-space: normal; text-align: right; }
   .confirmation-card, .fallback-card { grid-template-columns: 1fr; }
@@ -417,8 +440,8 @@ p, h1, h2, h3 { margin-top: 0; }
 }
 
 @media (forced-colors: active) {
-  body, .app-shell, .access-page, .access-story, .access-panel, .input-card, .visitor-stage, .caption-stage, .empty-stage, .metrics-card, .metric-card, .agent-card { background: Canvas; color: CanvasText; }
-  button, input, textarea, select, .scope-note, .segmented-control label, .input-card, .visitor-stage, .confirmation-card, .fallback-card, .support-details { border: 1px solid ButtonText; }
+  body, .app-shell, .access-page, .access-story, .access-panel, .input-card, .visitor-stage, .caption-stage, .empty-stage, .avatar-stage, .handtalk-avatar, .metrics-card, .metric-card, .agent-card { background: Canvas; color: CanvasText; }
+  button, input, textarea, select, .scope-note, .segmented-control label, .avatar-activation, .input-card, .visitor-stage, .confirmation-card, .fallback-card, .support-details { border: 1px solid ButtonText; }
   .primary-button, .stop-button { background: Highlight; color: HighlightText; }
   .demo-ribbon { background: CanvasText; color: Canvas; }
   .status-dot, .state-badge > span, .recording-meter span, .reason-row i { background: Highlight; }

@@ -1,4 +1,5 @@
 export * from "./api.js";
+export * from "./avatar.js";
 export * from "./builders.js";
 export * from "./catalog.js";
 export * from "./common.js";

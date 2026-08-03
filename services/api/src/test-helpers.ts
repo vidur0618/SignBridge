@@ -6,7 +6,7 @@ import {
 } from "@signbridge/contracts";
 import type { AppDependencies } from "./app.js";
 import { buildApp } from "./app.js";
-import { testConfig } from "./config.js";
+import { testConfig, type AppConfig } from "./config.js";
 import { InMemoryCatalogRepository } from "./adapters/catalog.js";
 import type { AssetSigner } from "./adapters/assets.js";
 import type { IntentClassifier } from "./adapters/classifier.js";
@@ -146,6 +146,7 @@ export function supportedClassifier(): IntentClassifier {
 }
 
 export async function makeTestApp(options: {
+  config?: Partial<AppConfig>;
   catalog?: Catalog;
   classifier?: IntentClassifier;
   assetSigner?: AssetSigner;
@@ -156,7 +157,7 @@ export async function makeTestApp(options: {
   dependencies: AppDependencies;
   events: MemoryEventRepository;
 }> {
-  const config = testConfig();
+  const config = testConfig(options.config);
   const speech = options.speech ?? fakeSpeech;
   const classifier = options.classifier ?? supportedClassifier();
   const pendingDecisions = new MemoryPendingDecisionRepository();

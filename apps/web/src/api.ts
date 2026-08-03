@@ -1,15 +1,22 @@
 import {
   AccessCodeExchangeResponseSchema,
   AdminMetricsResponseSchema,
+  AvatarAuthorizationResponseSchema,
+  AvatarExecutionEventResponseSchema,
+  AvatarRuntimeConfigResponseSchema,
   AudioTranscriptionResponseSchema,
   CatalogPublicResponseSchema,
   DecisionResponseSchema,
   FeedbackResponseSchema,
   type AccessCodeExchangeRequest,
+  type AvatarAuthorizationResponse,
+  type AvatarExecutionEventRequest,
+  type AvatarMessageSource,
   type DecisionRequest,
   type FeedbackRequest,
 } from "@signbridge/contracts";
 import type {
+  AvatarRuntimeConfig,
   DashboardMetrics,
   IntentCandidate,
   IntentId,
@@ -67,7 +74,7 @@ function publicErrorMessage(code: string | undefined): string {
 export async function exchangeSession(accessCode: string): Promise<SessionInfo> {
   const body: AccessCodeExchangeRequest = {
     accessCode,
-    consentVersion: "v2026-08-01",
+    consentVersion: "v2026-08-02-avatar",
   };
   const payload = parseContract(AccessCodeExchangeResponseSchema.safeParse(await requestJson("/api/session/exchange", {
     method: "POST",
@@ -101,6 +108,41 @@ export async function loadCatalog(): Promise<PublicCatalog> {
     language: "ase-US",
     intents,
   };
+}
+
+export async function loadAvatarConfig(): Promise<AvatarRuntimeConfig> {
+  return parseContract(
+    AvatarRuntimeConfigResponseSchema.safeParse(await requestJson("/api/avatar/config")),
+    "avatar runtime configuration",
+  );
+}
+
+export async function authorizeAvatar(
+  text: string,
+  source: AvatarMessageSource,
+): Promise<AvatarAuthorizationResponse> {
+  return parseContract(
+    AvatarAuthorizationResponseSchema.safeParse(await requestJson("/api/avatar/authorize", {
+      method: "POST",
+      body: JSON.stringify({
+        text,
+        locale: "en-US",
+        source,
+        staffConfirmed: true,
+      }),
+    })),
+    "avatar authorization",
+  );
+}
+
+export async function reportAvatarExecution(input: AvatarExecutionEventRequest): Promise<void> {
+  parseContract(
+    AvatarExecutionEventResponseSchema.safeParse(await requestJson("/api/avatar/events", {
+      method: "POST",
+      body: JSON.stringify(input),
+    })),
+    "avatar execution event",
+  );
 }
 
 export interface TranscriptionResult {
@@ -188,6 +230,7 @@ export async function loadMetrics(): Promise<DashboardMetrics> {
 }
 
 function normalizeTranscriptionResult(payload: Record<string, unknown> | null): TranscriptionResult {
+  const segments = Array.isArray(payload?.segments) ? payload.segments : [];
   const stableUtterances = Array.isArray(payload?.stableUtterances) ? payload.stableUtterances : [];
   const detectedIntents = Array.isArray(payload?.detectedIntents) ? payload.detectedIntents : [];
   const utterance = asRecord(payload?.utterance ?? payload?.stableUtterance ?? stableUtterances.at(-1));
@@ -199,7 +242,13 @@ function normalizeTranscriptionResult(payload: Record<string, unknown> | null): 
       ?? detectedIntents.at(-1)
       ?? (fallbackReason ? { status: "unsupported", reasonCode: fallbackReason } : null),
   );
-  const transcript = stringValue(utterance?.transcript ?? utterance?.text ?? payload?.transcript) ?? "";
+  const finalizedTranscript = segments
+    .map((segment) => stringValue(asRecord(segment)?.text))
+    .filter((text): text is string => Boolean(text))
+    .join(" ")
+    .trim();
+  const transcript = stringValue(utterance?.transcript ?? utterance?.text ?? payload?.transcript)
+    ?? finalizedTranscript;
   const utteranceId = stringValue(utterance?.id ?? detected?.utteranceId ?? payload?.utteranceId) ?? crypto.randomUUID();
   return {
     transcript,

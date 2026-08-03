@@ -1,8 +1,13 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   AccessCodeExchangeRequestSchema,
   AccessCodeExchangeResponseSchema,
   AdminMetricsResponseSchema,
+  AvatarAuthorizationRequestSchema,
+  AvatarAuthorizationResponseSchema,
+  AvatarExecutionEventRequestSchema,
+  AvatarExecutionEventResponseSchema,
+  AvatarRuntimeConfigResponseSchema,
   AudioTranscriptionResponseSchema,
   CatalogPublicResponseSchema,
   DecisionRequestSchema,
@@ -14,6 +19,7 @@ import {
   createRenderSegment,
   createSignPlan,
   isAssetRevoked,
+  runAvatarSafetyGate,
   type AudioSession,
   type ReceptionIntentId,
   type UnsupportedReasonCode,
@@ -117,6 +123,109 @@ export async function registerRoutes(app: FastifyInstance, dependencies: AppDepe
           catalog.assetForIntent(intent.id) !== null,
       })),
     });
+  });
+
+  app.get("/api/avatar/config", { preHandler: requireSite }, async (_request, reply) => {
+    reply.header("Cache-Control", "no-store");
+    const common = {
+      provider: "handtalk" as const,
+      avatar: config.handtalkAvatar,
+      language: "enUS" as const,
+      signLanguage: "en-ase" as const,
+      maxCharacters: 1_000 as const,
+      status: "experimental" as const,
+    };
+    return AvatarRuntimeConfigResponseSchema.parse(
+      config.handtalkToken
+        ? {
+            ...common,
+            enabled: true,
+            token: config.handtalkToken,
+            sdkUrl: config.handtalkSdkUrl,
+          }
+        : {
+            ...common,
+            enabled: false,
+          },
+    );
+  });
+
+  app.post("/api/avatar/authorize", { preHandler: requireSite }, async (request, reply) => {
+    const auth = request.authSession;
+    if (!auth) return reply.code(401).send({ error: "authentication_required" });
+    if (!config.handtalkToken) return reply.code(503).send({ error: "avatar_unavailable" });
+    const parsed = AvatarAuthorizationRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid_avatar_authorization" });
+
+    const gate = runAvatarSafetyGate({
+      text: parsed.data.text,
+      locale: parsed.data.locale,
+      isFinal: true,
+    });
+    const flow = avatarFlow(parsed.data.source);
+    if (!gate.allowed) {
+      await events.record({
+        eventId: randomUUID(),
+        occurredAt: new Date().toISOString(),
+        siteId: auth.siteId,
+        sessionId: auth.sessionId,
+        type: "fallback",
+        flow,
+        fallbackReason: gate.reasonCode,
+        staffDecision: "fallback",
+      });
+      return AvatarAuthorizationResponseSchema.parse(gate);
+    }
+
+    const authorizationId = createAvatarAuthorizationId(auth.sessionId, config.sessionSecret);
+    await events.record({
+      eventId: randomUUID(),
+      occurredAt: new Date().toISOString(),
+      siteId: auth.siteId,
+      sessionId: auth.sessionId,
+      type: "avatar_authorized",
+      flow,
+      staffDecision: "play",
+      consentVersion: auth.consentVersion,
+      avatarProvider: "handtalk",
+      avatarName: config.handtalkAvatar,
+      avatarAuthorizationId: authorizationId,
+    });
+    return AvatarAuthorizationResponseSchema.parse({
+      allowed: true,
+      authorizationId,
+      provider: "handtalk",
+      text: gate.normalizedText,
+    });
+  });
+
+  app.post("/api/avatar/events", { preHandler: requireSite }, async (request, reply) => {
+    const auth = request.authSession;
+    if (!auth) return reply.code(401).send({ error: "authentication_required" });
+    if (!config.handtalkToken) return reply.code(503).send({ error: "avatar_unavailable" });
+    const parsed = AvatarExecutionEventRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid_avatar_event" });
+    if (!verifyAvatarAuthorizationId(
+      parsed.data.authorizationId,
+      auth.sessionId,
+      config.sessionSecret,
+    )) {
+      return reply.code(409).send({ error: "avatar_event_not_authorized" });
+    }
+    await events.record({
+      eventId: randomUUID(),
+      occurredAt: new Date().toISOString(),
+      siteId: auth.siteId,
+      sessionId: auth.sessionId,
+      type: "avatar_execution",
+      consentVersion: auth.consentVersion,
+      avatarProvider: "handtalk",
+      avatarName: config.handtalkAvatar,
+      avatarAuthorizationId: parsed.data.authorizationId,
+      avatarResult: parsed.data.result,
+      ...(parsed.data.latencyMs != null ? { avatarLatencyMs: parsed.data.latencyMs } : {}),
+    });
+    return reply.code(202).send(AvatarExecutionEventResponseSchema.parse({ accepted: true }));
   });
 
   app.post("/api/audio/transcribe", { preHandler: requireSite }, async (request, reply) => {
@@ -490,6 +599,47 @@ function normalizeMimeType(value: string): "audio/wav" | "audio/mpeg" | "audio/w
 
 function completeSession(session: AudioSession, lifecycle: "complete" | "failed"): AudioSession {
   return { ...session, lifecycle, endedAt: new Date().toISOString() };
+}
+
+function avatarFlow(source: "speech" | "upload" | "type" | "phrase"): "live" | "upload" | "typed" | "manual" {
+  if (source === "speech") return "live";
+  if (source === "type") return "typed";
+  if (source === "phrase") return "manual";
+  return source;
+}
+
+function createAvatarAuthorizationId(sessionId: string, secret: string): string {
+  const requestId = randomUUID();
+  const expiresAt = Math.floor((Date.now() + 5 * 60_000) / 1_000).toString(36);
+  const signature = avatarAuthorizationSignature(sessionId, requestId, expiresAt, secret);
+  return `${requestId}.${expiresAt}.${signature}`;
+}
+
+function verifyAvatarAuthorizationId(
+  authorizationId: string,
+  sessionId: string,
+  secret: string,
+): boolean {
+  const [requestId, expiresAt, signature, ...extra] = authorizationId.split(".");
+  if (!requestId || !expiresAt || !signature || extra.length > 0) return false;
+  const expirySeconds = Number.parseInt(expiresAt, 36);
+  if (!Number.isFinite(expirySeconds) || expirySeconds * 1_000 <= Date.now()) return false;
+  const expected = avatarAuthorizationSignature(sessionId, requestId, expiresAt, secret);
+  const actualBytes = Buffer.from(signature);
+  const expectedBytes = Buffer.from(expected);
+  return actualBytes.length === expectedBytes.length && timingSafeEqual(actualBytes, expectedBytes);
+}
+
+function avatarAuthorizationSignature(
+  sessionId: string,
+  requestId: string,
+  expiresAt: string,
+  secret: string,
+): string {
+  return createHmac("sha256", secret)
+    .update(`${sessionId}:${requestId}:${expiresAt}`)
+    .digest("base64url")
+    .slice(0, 22);
 }
 
 function normalizePendingReason(reason: string): UnsupportedReasonCode {

@@ -66,6 +66,8 @@ export interface UsageEvent {
     | "fallback"
     | "feedback_received"
     | "playback_event"
+    | "avatar_authorized"
+    | "avatar_execution"
     | "latency_sample"
     | "operations_report";
   flow?: "live" | "upload" | "typed" | "manual";
@@ -88,6 +90,12 @@ export interface UsageEvent {
     | "warm_playback_after_confirmation";
   feedbackCategory?: string;
   feedbackSeverity?: string;
+  consentVersion?: string;
+  avatarProvider?: "handtalk";
+  avatarName?: "HUGO" | "MAYA";
+  avatarAuthorizationId?: string;
+  avatarResult?: "started" | "completed" | "failed";
+  avatarLatencyMs?: number;
   reportId?: string;
 }
 

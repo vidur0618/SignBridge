@@ -1,5 +1,9 @@
 import { resolve } from "node:path";
+import { HandTalkAvatarSchema, type HandTalkAvatar } from "@signbridge/contracts";
 import { z } from "zod";
+
+export const DEFAULT_HANDTALK_SDK_URL =
+  "https://api-cdn.handtalk.me/sdk/1.0.0/ht-api-sdk.min.js";
 
 const booleanFromString = z
   .enum(["true", "false"])
@@ -27,6 +31,12 @@ const EnvSchema = z
     GOOGLE_SPEECH_RECOGNIZER: z.string().default("_"),
     GOOGLE_SPEECH_MODEL: z.string().default("chirp_3"),
     GEMINI_MODEL: z.string().default("gemini-3.6-flash"),
+    HANDTALK_TOKEN: z.preprocess(
+      (value) => (value === "" ? undefined : value),
+      z.string().min(1).max(8_192).optional(),
+    ),
+    HANDTALK_SDK_URL: z.literal(DEFAULT_HANDTALK_SDK_URL).default(DEFAULT_HANDTALK_SDK_URL),
+    HANDTALK_AVATAR: HandTalkAvatarSchema.default("HUGO"),
     SIGN_ASSET_BUCKET: z.string().optional(),
     FIRESTORE_DATABASE: z.string().default("(default)"),
     SIGN_CATALOG_PATH: z.string().optional(),
@@ -87,6 +97,9 @@ export type AppConfig = Readonly<{
   googleSpeechRecognizer: string;
   googleSpeechModel: string;
   geminiModel: string;
+  handtalkToken?: string;
+  handtalkSdkUrl: typeof DEFAULT_HANDTALK_SDK_URL;
+  handtalkAvatar: HandTalkAvatar;
   signAssetBucket?: string;
   firestoreDatabase: string;
   signCatalogPath?: string;
@@ -122,6 +135,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     googleSpeechRecognizer: parsed.GOOGLE_SPEECH_RECOGNIZER,
     googleSpeechModel: parsed.GOOGLE_SPEECH_MODEL,
     geminiModel: parsed.GEMINI_MODEL,
+    ...(parsed.HANDTALK_TOKEN ? { handtalkToken: parsed.HANDTALK_TOKEN } : {}),
+    handtalkSdkUrl: parsed.HANDTALK_SDK_URL,
+    handtalkAvatar: parsed.HANDTALK_AVATAR,
     ...(parsed.SIGN_ASSET_BUCKET ? { signAssetBucket: parsed.SIGN_ASSET_BUCKET } : {}),
     firestoreDatabase: parsed.FIRESTORE_DATABASE,
     ...(parsed.SIGN_CATALOG_PATH ? { signCatalogPath: resolve(parsed.SIGN_CATALOG_PATH) } : {}),
@@ -162,6 +178,8 @@ export function testConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     googleSpeechRecognizer: "_",
     googleSpeechModel: "chirp_3",
     geminiModel: "gemini-3.6-flash",
+    handtalkSdkUrl: DEFAULT_HANDTALK_SDK_URL,
+    handtalkAvatar: "HUGO",
     firestoreDatabase: "(default)",
     maxLiveSessionsPerSite: 2,
     signedUrlTtlSeconds: 300,

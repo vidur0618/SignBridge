@@ -96,6 +96,12 @@ export async function createDependencies(config: AppConfig): Promise<AppDependen
 }
 
 export async function buildApp(dependencies: AppDependencies): Promise<FastifyInstance> {
+  const avatarSdkOrigin = dependencies.config.handtalkToken
+    ? new URL(dependencies.config.handtalkSdkUrl).origin
+    : null;
+  const avatarConnectSources = dependencies.config.handtalkToken
+    ? ["https://handtalk.me", "https://*.handtalk.me", "wss://*.handtalk.me"]
+    : [];
   const app = Fastify({
     logger:
       dependencies.config.nodeEnv === "test"
@@ -120,11 +126,12 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     contentSecurityPolicy: {
       directives: {
         defaultSrc: ["'self'"],
-        scriptSrc: ["'self'"],
+        scriptSrc: ["'self'", ...(avatarSdkOrigin ? [avatarSdkOrigin] : [])],
         styleSrc: ["'self'", "'unsafe-inline'"],
-        imgSrc: ["'self'", "data:"],
+        imgSrc: ["'self'", "data:", "blob:", ...(dependencies.config.handtalkToken ? ["https://*.handtalk.me"] : [])],
         mediaSrc: ["'self'", "https:", "blob:"],
-        connectSrc: ["'self'", "ws:", "wss:"],
+        connectSrc: ["'self'", "ws:", "wss:", ...avatarConnectSources],
+        workerSrc: ["'self'", "blob:"],
         frameAncestors: ["'none'"],
         baseUri: ["'self'"],
         formAction: ["'self'"],

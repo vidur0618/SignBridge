@@ -95,19 +95,19 @@ export async function registerLiveTranscription(
           });
           await recordTerminal({ fallbackReason: "no_final_transcript" });
         } else if (session) {
+          if (stoppedAt != null) {
+            await dependencies.events.record({
+              eventId: randomUUID(),
+              occurredAt: new Date().toISOString(),
+              siteId: auth.siteId,
+              sessionId: auth.sessionId,
+              type: "latency_sample",
+              flow: "live",
+              latencyKind: "final_after_release",
+              latencyMs: Math.max(0, Date.now() - stoppedAt),
+            });
+          }
           try {
-            if (stoppedAt != null) {
-              await dependencies.events.record({
-                eventId: randomUUID(),
-                occurredAt: new Date().toISOString(),
-                siteId: auth.siteId,
-                sessionId: auth.sessionId,
-                type: "latency_sample",
-                flow: "live",
-                latencyKind: "final_after_release",
-                latencyMs: Math.max(0, Date.now() - stoppedAt),
-              });
-            }
             const bundle = await dependencies.transcription.classifyFinalSegments(
               auth,
               session,

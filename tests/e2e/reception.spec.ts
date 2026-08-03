@@ -5,7 +5,9 @@ import { join } from "node:path";
 async function openDemo(page: import("@playwright/test").Page): Promise<void> {
   await page.goto("/");
   await page.getByRole("button", { name: "Explore local demo" }).click();
-  await expect(page.getByText("Local product demo")).toBeVisible();
+  const demoRibbon = page.locator(".demo-ribbon");
+  await expect(demoRibbon).toContainText("Local product demo");
+  await expect(demoRibbon).toContainText("Scripted transcript and browser-only rules. No Cloud Speech, Gemini, Hand Talk, Firestore, or reviewed ASL assets.");
 }
 
 function silentWav(durationSeconds = 0.2): Buffer {
@@ -33,6 +35,8 @@ const FIXTURE_FUTURE = "2027-08-01T12:00:00.000Z";
 
 interface ProductionShellOptions {
   publishedGreeting?: boolean;
+  avatarEnabled?: boolean;
+  onAvatarConfigRequest?: () => void;
 }
 
 async function openMockedProduction(
@@ -42,7 +46,7 @@ async function openMockedProduction(
   await page.route("**/api/session/exchange", async (route) => {
     expect(route.request().postDataJSON()).toEqual({
       accessCode: "pilot-code",
-      consentVersion: "v2026-08-01",
+      consentVersion: "v2026-08-02-avatar",
     });
     await route.fulfill({
       json: {
@@ -71,6 +75,33 @@ async function openMockedProduction(
       },
     });
   });
+  await page.route("**/api/avatar/config", async (route) => {
+    options.onAvatarConfigRequest?.();
+    expect(route.request().method()).toBe("GET");
+    await route.fulfill({
+      json: options.avatarEnabled
+        ? {
+            provider: "handtalk",
+            enabled: true,
+            token: "handtalk-e2e-token",
+            sdkUrl: "https://api-cdn.handtalk.me/sdk/1.0.0/ht-api-sdk.min.js",
+            avatar: "HUGO",
+            language: "enUS",
+            signLanguage: "en-ase",
+            maxCharacters: 1_000,
+            status: "experimental",
+          }
+        : {
+            provider: "handtalk",
+            enabled: false,
+            avatar: "HUGO",
+            language: "enUS",
+            signLanguage: "en-ase",
+            maxCharacters: 1_000,
+            status: "experimental",
+          },
+    });
+  });
 
   await page.goto("/");
   await page.getByLabel("Site access code").fill("pilot-code");
@@ -78,6 +109,52 @@ async function openMockedProduction(
   await page.getByRole("button", { name: "Open reception" }).click();
   await expect(page.getByRole("heading", { name: "Help every visitor feel understood." })).toBeVisible();
   await expect(page.getByText("Local product demo")).toHaveCount(0);
+}
+
+async function installMockHandTalkSdk(
+  page: import("@playwright/test").Page,
+): Promise<{ requestCount: () => number }> {
+  let requests = 0;
+  await page.route("https://api-cdn.handtalk.me/**", async (route) => {
+    requests += 1;
+    expect(route.request().url()).toBe("https://api-cdn.handtalk.me/sdk/1.0.0/ht-api-sdk.min.js");
+    await route.fulfill({
+      contentType: "application/javascript",
+      body: `(() => {
+        const testWindow = window;
+        testWindow.handTalkTranslateCalls = [];
+        class MockHandTalkApi {
+          constructor(config) {
+            this.isLoaded = true;
+            this.state = "ready";
+            this.listeners = new Set();
+            testWindow.handTalkConstructorConfig = config;
+          }
+          active() { this.state = "ready"; this.emit(); }
+          disable() { return Promise.resolve(); }
+          translate(sentence) {
+            testWindow.handTalkTranslateCalls.push(sentence);
+            this.state = "ready";
+            return Promise.resolve();
+          }
+          pause() { this.state = "paused"; this.emit(); }
+          resume() { this.state = "translating"; this.emit(); }
+          repeat() { return Promise.resolve(); }
+          stop() { this.state = "ready"; this.emit(); return Promise.resolve(); }
+          maximize() { this.state = "ready"; this.emit(); }
+          changeAnimationSpeed() {}
+          getApplicationState() { return this.state; }
+          onApplicationStateChange(callback) {
+            this.listeners.add(callback);
+            return () => this.listeners.delete(callback);
+          }
+          emit() { for (const callback of this.listeners) callback(this.state); }
+        }
+        testWindow.HTApi = MockHandTalkApi;
+      })();`,
+    });
+  });
+  return { requestCount: () => requests };
 }
 
 async function installMockLiveCapture(
@@ -303,12 +380,12 @@ test("access gate explains consent, scope, and demo provenance", async ({ page }
   await page.goto("/");
 
   await expect(page.getByRole("heading", { name: "Make the first conversation accessible." })).toBeVisible();
-  await expect(page.getByText(/not emergency, medical, legal/i)).toBeVisible();
+  await expect(page.getByText("Automatic avatar output is experimental, may be wrong, and is not certified interpretation. Use qualified support for consequential communication.")).toBeVisible();
   await expect(page.getByRole("button", { name: "Open reception" })).toBeDisabled();
   await page.getByLabel("Site access code").fill("pilot-code");
   await page.getByRole("checkbox").check();
   await expect(page.getByRole("button", { name: "Open reception" })).toBeEnabled();
-  await expect(page.getByText(/No cloud services or reviewed ASL media/i)).toBeVisible();
+  await expect(page.getByText("Clearly labeled caption simulation. No cloud service or avatar provider is called.")).toBeVisible();
 });
 
 test("access and reception screens have no serious or critical automated accessibility violations", async ({ page }) => {
@@ -319,7 +396,7 @@ test("access and reception screens have no serious or critical automated accessi
   expect(seriousAccessibilityViolations(accessResults.violations)).toEqual([]);
 
   await page.getByRole("button", { name: "Explore local demo" }).click();
-  await expect(page.getByText("Local product demo")).toBeVisible();
+  await expect(page.locator(".demo-ribbon")).toContainText("Scripted transcript and browser-only rules. No Cloud Speech, Gemini, Hand Talk, Firestore, or reviewed ASL assets.");
   if (captureDirectory) await page.screenshot({ path: join(captureDirectory, "signbridge-reception.png"), fullPage: true });
   const receptionResults = await new AxeBuilder({ page }).analyze();
   expect(seriousAccessibilityViolations(receptionResults.violations)).toEqual([]);
@@ -457,6 +534,7 @@ test("production playback failure preserves the finalized English caption", asyn
     await route.abort("failed");
   });
   await openMockedProduction(page, { publishedGreeting: true });
+  await page.getByRole("radio", { name: /Reviewed ASL \+ captions/ }).check();
   await page.getByRole("button", { name: /Upload/ }).click();
   await page.getByRole("checkbox", { name: /authorized to process this recording/i }).check();
   await page.locator('input[type="file"]').setInputFiles({
@@ -473,8 +551,110 @@ test("production playback failure preserves the finalized English caption", asyn
   await expect(page.locator("video")).toHaveCount(0);
 });
 
+test("captions-only default never fetches avatar configuration or SDK code", async ({ page }) => {
+  let configRequests = 0;
+  let authorizationRequests = 0;
+  const sdk = await installMockHandTalkSdk(page);
+  await page.route("**/api/avatar/authorize", async (route) => {
+    authorizationRequests += 1;
+    await route.fulfill({ status: 500, json: { code: "unexpected_avatar_request", message: "Unexpected test request." } });
+  });
+  await openMockedProduction(page, {
+    avatarEnabled: true,
+    onAvatarConfigRequest: () => { configRequests += 1; },
+  });
+
+  await expect(page.getByRole("radio", { name: /Captions only/ })).toBeChecked();
+  await page.getByRole("button", { name: "Type English message" }).click();
+  await page.getByLabel("Message for the visitor").fill("Please wait here.");
+  await page.getByRole("button", { name: "Show caption" }).click();
+
+  await expect(page.locator(".final-caption p")).toHaveText("Please wait here.");
+  expect(configRequests).toBe(0);
+  expect(authorizationRequests).toBe(0);
+  expect(sdk.requestCount()).toBe(0);
+});
+
+test("avatar mode requires activation and per-message confirmation before provider translation", async ({ page }) => {
+  let configRequests = 0;
+  const authorizationBodies: unknown[] = [];
+  const executionBodies: Array<{ authorizationId: string; result: string; latencyMs?: number }> = [];
+  const sdk = await installMockHandTalkSdk(page);
+  await page.route("**/api/avatar/authorize", async (route) => {
+    authorizationBodies.push(route.request().postDataJSON());
+    await route.fulfill({
+      json: {
+        allowed: true,
+        authorizationId: "avatar-auth-test-1",
+        provider: "handtalk",
+        text: "The blue umbrella is waiting beside the chair.",
+      },
+    });
+  });
+  await page.route("**/api/avatar/events", async (route) => {
+    executionBodies.push(route.request().postDataJSON() as { authorizationId: string; result: string; latencyMs?: number });
+    await route.fulfill({ json: { accepted: true } });
+  });
+  await openMockedProduction(page, {
+    avatarEnabled: true,
+    onAvatarConfigRequest: () => { configRequests += 1; },
+  });
+
+  await page.getByRole("radio", { name: /Experimental avatar \+ captions/ }).check();
+  const activation = page.getByRole("checkbox", { name: /The visitor chose the experimental avatar/i });
+  const enableAvatar = page.getByRole("button", { name: "Enable experimental avatar" });
+  await expect(enableAvatar).toBeDisabled();
+  expect(configRequests).toBe(0);
+  expect(sdk.requestCount()).toBe(0);
+
+  await activation.check();
+  await enableAvatar.click();
+  await expect(page.getByText("Provider ready. Each message still requires separate confirmation.")).toBeVisible();
+  expect(configRequests).toBe(1);
+  expect(sdk.requestCount()).toBe(0);
+
+  const message = "The blue umbrella is waiting beside the chair.";
+  await page.getByRole("button", { name: "Type English message" }).click();
+  await page.getByLabel("Message for the visitor").fill(message);
+  await page.getByRole("button", { name: "Prepare avatar & caption" }).click();
+
+  await expect(page.getByRole("heading", { name: "Send this caption to the experimental avatar?" })).toBeVisible();
+  await expect(page.locator(".final-caption p")).toHaveText(message);
+  expect(authorizationBodies).toHaveLength(0);
+  expect(sdk.requestCount()).toBe(0);
+
+  await page.getByRole("button", { name: "Keep captions only" }).click();
+  await expect(page.locator(".final-caption p")).toHaveText(message);
+  expect(authorizationBodies).toHaveLength(0);
+  expect(sdk.requestCount()).toBe(0);
+
+  await page.getByRole("button", { name: "Prepare avatar & caption" }).click();
+  await page.getByRole("button", { name: "Confirm avatar message" }).click();
+
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { handTalkTranslateCalls?: string[] }
+  ).handTalkTranslateCalls ?? [])).toEqual([message]);
+  expect(authorizationBodies).toEqual([{
+    text: message,
+    locale: "en-US",
+    source: "type",
+    staffConfirmed: true,
+  }]);
+  expect(sdk.requestCount()).toBe(1);
+  await expect.poll(() => executionBodies.map(({ result }) => result)).toEqual(["started", "completed"]);
+  for (const event of executionBodies) {
+    expect(event.authorizationId).toBe("avatar-auth-test-1");
+    expect(event.latencyMs).toBeGreaterThanOrEqual(0);
+    expect(event.latencyMs).toBeLessThanOrEqual(120_000);
+  }
+  await expect(page.locator(".video-caption p")).toHaveText(message);
+  await expect(page.getByText("English caption · final")).toBeVisible();
+  await expect(page.getByText(/Staff confirmed this message/i)).toBeVisible();
+});
+
 test("demo speech flow marks provisional text and blocks fake ASL playback", async ({ page }) => {
   await openDemo(page);
+  await page.getByRole("radio", { name: /Reviewed ASL \+ captions/ }).check();
 
   await page.getByRole("button", { name: "Start microphone" }).click();
   await expect(page.getByRole("button", { name: "Stop & finalize" })).toBeVisible();
@@ -490,12 +670,12 @@ test("demo speech flow marks provisional text and blocks fake ASL playback", asy
 
   await expect(page.getByText(/Demo boundary reached/i)).toBeVisible();
   await expect(page.locator("video")).toHaveCount(0);
-  await expect(page.getByText(/No Cloud Speech, Gemini, Firestore, or reviewed ASL assets/i)).toBeVisible();
+  await expect(page.getByText(/No Cloud Speech, Gemini, Hand Talk, Firestore, or reviewed ASL assets/i)).toBeVisible();
 });
 
 test("high-stakes typed content takes the safe fallback", async ({ page }) => {
   await openDemo(page);
-  await page.getByRole("button", { name: /Type/ }).click();
+  await page.getByRole("button", { name: "Type English message" }).click();
   await page.getByLabel("Message for the visitor").fill("This is a medical emergency and we need a doctor.");
   await page.getByRole("button", { name: "Show caption" }).click();
 
@@ -506,8 +686,8 @@ test("high-stakes typed content takes the safe fallback", async ({ page }) => {
 
 test("captions-only mode never offers ASL approval", async ({ page }) => {
   await openDemo(page);
-  await page.getByRole("radio", { name: /Captions only/ }).check();
-  await page.getByRole("button", { name: /Type/ }).click();
+  await expect(page.getByRole("radio", { name: /Captions only/ })).toBeChecked();
+  await page.getByRole("button", { name: "Type English message" }).click();
   await page.getByLabel("Message for the visitor").fill("Please wait here.");
   await page.getByRole("button", { name: "Show caption" }).click();
 
@@ -517,7 +697,8 @@ test("captions-only mode never offers ASL approval", async ({ page }) => {
 
 test("switching to captions only withdraws an already displayed approval choice", async ({ page }) => {
   await openDemo(page);
-  await page.getByRole("button", { name: /Type/ }).click();
+  await page.getByRole("radio", { name: /Reviewed ASL \+ captions/ }).check();
+  await page.getByRole("button", { name: "Type English message" }).click();
   await page.getByLabel("Message for the visitor").fill("Hello, welcome.");
   await page.getByRole("button", { name: "Show caption" }).click();
   await expect(page.getByRole("button", { name: "Approve ASL phrase" })).toBeVisible();
@@ -531,6 +712,7 @@ test("switching to captions only withdraws an already displayed approval choice"
 
 test("demo upload validates a small WAV locally without claiming transcription", async ({ page }) => {
   await openDemo(page);
+  await page.getByRole("radio", { name: /Reviewed ASL \+ captions/ }).check();
   await page.getByRole("button", { name: /Upload/ }).click();
   const fileInput = page.locator('input[type="file"]');
   await expect(fileInput).toBeDisabled();
@@ -552,7 +734,8 @@ test("demo upload validates a small WAV locally without claiming transcription",
 
 test("staff can reject a supported candidate and retain the caption", async ({ page }) => {
   await openDemo(page);
-  await page.getByRole("button", { name: /Type/ }).click();
+  await page.getByRole("radio", { name: /Reviewed ASL \+ captions/ }).check();
+  await page.getByRole("button", { name: "Type English message" }).click();
   await page.getByLabel("Message for the visitor").fill("Hello, welcome.");
   await page.getByRole("button", { name: "Show caption" }).click();
   await page.getByRole("button", { name: "Use captions only" }).click();
@@ -568,7 +751,11 @@ test("core demo path is operable from the keyboard", async ({ page }) => {
   await demoButton.focus();
   await page.keyboard.press("Enter");
 
-  const typeTab = page.getByRole("button", { name: /Type/ });
+  const reviewedMode = page.getByRole("radio", { name: /Reviewed ASL \+ captions/ });
+  await reviewedMode.focus();
+  await page.keyboard.press("Space");
+
+  const typeTab = page.getByRole("button", { name: "Type English message" });
   await typeTab.focus();
   await page.keyboard.press("Enter");
   const message = page.getByLabel("Message for the visitor");
@@ -616,7 +803,7 @@ test("forced colors and reduced motion retain usable controls", async ({ page })
   await openDemo(page);
 
   await expect(page.getByRole("button", { name: "Start microphone" })).toBeVisible();
-  await expect(page.getByText("Reception conversations only")).toBeVisible();
+  await expect(page.getByText("Signing is always opt-in")).toBeVisible();
   const mediaStyles = await page.evaluate(() => ({
     scrollBehavior: getComputedStyle(document.documentElement).scrollBehavior,
     animationDuration: getComputedStyle(document.querySelector(".status-dot") as Element).animationDuration,

@@ -23,6 +23,26 @@ export const SafetyGateResultSchema = z.discriminatedUnion("allowed", [
 ]);
 export type SafetyGateResult = z.infer<typeof SafetyGateResultSchema>;
 
+export const AvatarSafetyGateInputSchema = z
+  .object({
+    text: z.string().max(1_000),
+    locale: z.string().min(2).max(35),
+    isFinal: z.boolean(),
+  })
+  .strict();
+export type AvatarSafetyGateInput = z.infer<typeof AvatarSafetyGateInputSchema>;
+
+export const AvatarSafetyGateResultSchema = z.discriminatedUnion("allowed", [
+  z.object({ allowed: z.literal(true), normalizedText: z.string().min(1).max(1_000) }).strict(),
+  z
+    .object({
+      allowed: z.literal(false),
+      reasonCode: UnsupportedReasonCodeSchema,
+    })
+    .strict(),
+]);
+export type AvatarSafetyGateResult = z.infer<typeof AvatarSafetyGateResultSchema>;
+
 const HIGH_STAKES_PATTERNS = [
   /\b(?:emergenc(?:y|ies)|911|ambulance|fire|smoke|evacuat(?:e|ion)|lockdown|active\s+shooter|shoot(?:er|ing)?|gun|firearm|weapon|knife|bomb|explosive)\b/i,
   /\b(?:doctor|nurse|hospital|medical|medicine|medication|prescription|allerg(?:y|ic)|diagnos(?:is|e)|heart\s+attack|stroke|seizure|pain|bleed(?:ing)?|unconscious|can(?:not|'t)\s+breathe|injur(?:y|ed))\b/i,
@@ -67,7 +87,7 @@ const VARIABLE_NAME_PATTERNS = [
 
 const NUMBER_WORD_PATTERN = /\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|dozen|noon|midnight)\b/iu;
 
-function blocked(reasonCode: UnsupportedReasonCode): SafetyGateResult {
+function blocked(reasonCode: UnsupportedReasonCode): Extract<SafetyGateResult, { allowed: false }> {
   return { allowed: false, reasonCode };
 }
 
@@ -111,6 +131,41 @@ export function runSafetyGate(rawInput: SafetyGateInput): SafetyGateResult {
   }
   if (!BOUNDED_DOMAIN_PATTERNS.some((pattern) => pattern.test(matchText))) {
     return blocked("out_of_domain");
+  }
+
+  return { allowed: true, normalizedText: text };
+}
+
+/**
+ * Deterministic boundary for the experimental open-input avatar lane. Unlike
+ * the reviewed phrase gate, this permits ordinary out-of-domain English, but
+ * it still blocks partial, consequential, injected, identity-bearing, and
+ * number-heavy messages before any text can be sent to the avatar provider.
+ */
+export function runAvatarSafetyGate(rawInput: AvatarSafetyGateInput): AvatarSafetyGateResult {
+  const input = AvatarSafetyGateInputSchema.parse(rawInput);
+  if (!input.isFinal) return blocked("partial_transcript");
+
+  const text = input.text.trim().replace(/\s+/g, " ");
+  if (!text) return blocked("empty_transcript");
+  if (!LocaleSchema.safeParse(input.locale).success) return blocked("unsupported_language");
+
+  const words = text.split(" ");
+  const matchText = text.replace(/\u2019/g, "'");
+  if (text.length > 1_000 || words.length > 150) return blocked("transcript_too_long");
+  if (PROMPT_INJECTION_PATTERNS.some((pattern) => pattern.test(matchText))) {
+    return blocked("prompt_injection");
+  }
+  if (HIGH_STAKES_PATTERNS.some((pattern) => pattern.test(matchText))) {
+    return blocked("high_stakes_content");
+  }
+
+  const containsVariableContact = /(?:\b\d\b|\d{2,}|@|https?:\/\/|www\.)/i.test(matchText);
+  const containsSpecificName = VARIABLE_NAME_PATTERNS.some((pattern) => pattern.test(matchText));
+  const textWithoutBoundedRepairIdiom = matchText.replace(/\bone\s+more\s+time\b/giu, "");
+  const containsSpokenNumber = NUMBER_WORD_PATTERN.test(textWithoutBoundedRepairIdiom);
+  if (containsVariableContact || containsSpecificName || containsSpokenNumber) {
+    return blocked("name_or_number_heavy");
   }
 
   return { allowed: true, normalizedText: text };

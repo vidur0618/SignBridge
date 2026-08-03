@@ -1,5 +1,57 @@
-import { describe, expect, it } from "vitest";
-import { normalizeLiveEvent } from "./api.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { loadAvatarConfig, normalizeLiveEvent } from "./api.js";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe("avatar runtime configuration", () => {
+  it("loads a token-free disabled configuration with same-origin credentials", async () => {
+    const payload = {
+      provider: "handtalk",
+      enabled: false,
+      avatar: "HUGO",
+      language: "enUS",
+      signLanguage: "en-ase",
+      maxCharacters: 1_000,
+      status: "experimental",
+    };
+    const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>): Promise<Response> => new Response(
+      JSON.stringify(payload),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadAvatarConfig()).resolves.toEqual(payload);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/avatar/config",
+      expect.objectContaining({ credentials: "same-origin" }),
+    );
+  });
+
+  it("rejects an invalid disabled response that leaks provider credentials", async () => {
+    const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>): Promise<Response> => new Response(
+      JSON.stringify({
+        provider: "handtalk",
+        enabled: false,
+        token: "must-not-be-returned",
+        avatar: "HUGO",
+        language: "enUS",
+        signLanguage: "en-ase",
+        maxCharacters: 1_000,
+        status: "experimental",
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadAvatarConfig()).rejects.toMatchObject({
+      name: "ApiError",
+      status: 502,
+      code: "invalid_contract",
+    });
+  });
+});
 
 describe("live event normalization", () => {
   it("keeps provisional captions separate from final captions", () => {

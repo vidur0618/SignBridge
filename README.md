@@ -1,51 +1,64 @@
 # SignBridge Reception
 
-A captions-first, staffed front-desk communication aid that can use AI to select one bounded, human-recorded, independently Deaf-reviewed ASL phrase—only after staff confirmation.
+A captions-first, staffed front-desk communication aid with two clearly separated signing lanes: a bounded human-recorded phrase catalog intended for production review, and an opt-in experimental Hand Talk WebGL avatar.
 
 > [!IMPORTANT]
-> This repository is a **code-complete, locally tested pilot scaffold**, not yet a production deployment or a market-ready ASL product. The tracked catalog contains ten intent definitions and **zero signing assets**; playback is disabled. No signer/reviewer approval, cloud execution, customer, invoice, revenue, or Deaf-user acceptance is claimed.
+> This repository is a locally implemented hybrid prototype, not a production deployment or an unrestricted English-to-ASL interpreter. The reviewed catalog defines ten intents but contains **zero approved signing assets**, so reviewed playback is disabled. No Hand Talk token, Google Application Default Credentials, real Speech-to-Text result, Vertex/Gemini response, or provider-rendered avatar has yet been tested.
 
 > [!CAUTION]
-> SignBridge Reception is not an interpreter and must not be used for emergencies, medicine, law, security, payments, identity verification, employment rights, or other consequential communication. Unsupported content stays in captions, typing, manual phrase selection, or the pilot site's established communication-support process.
+> The experimental avatar may be wrong and is not certified interpretation. Do not use SignBridge for emergencies, medicine, law, security, payments, identity verification, employment rights, or other consequential communication. Keep the finalized English caption visible and use the site's qualified communication-support process.
+
+## Two lanes, two assurance levels
+
+| Lane | Intended use | What it does | Current status |
+| --- | --- | --- | --- |
+| Reviewed phrase catalog | Production-target bounded reception messages | Final Google STT text → deterministic gate → one Gemini enum candidate or `unsupported` → staff confirmation → one complete human-recorded, independently Deaf-reviewed asset | Code-complete scaffold; playback blocked because no approved media, rights, or review exists |
+| Hand Talk avatar | Opt-in open-input evaluation | Final speech/upload transcript or explicitly submitted English → deterministic consequential/name/number gate → per-message staff confirmation → Hand Talk for Devs JavaScript SDK 1.0.0 → WebGL synthetic ASL avatar | Integration code present; no contracted token, provider execution, DPA, or independent Deaf evaluation |
+
+The experimental lane does not inherit the reviewed lane's linguistic assurance. A successful animation is not evidence that its meaning is correct. Captions-only mode makes no avatar request.
+
+The [World Federation of the Deaf and World Association of Sign Language Interpreters statement on signing avatars](https://wfdeaf.org/wp-content/uploads/WFD-and-WASLI-Statement-on-Avatar-FINAL-14032018-Updated-14042018.pdf) explains why word-for-sign substitution cannot represent signed-language grammar and warns against replacing qualified interpreters with avatars for live, complex, or important communication.
 
 ## What is implemented
 
-- A single-screen React/Vite reception interface for staff-controlled microphone capture, uploaded audio, typing, and manual phrase selection.
+- A React/Vite reception interface for staff-controlled microphone capture, uploaded audio, typing, manual phrase selection, captions-only use, and opt-in avatar presentation.
 - Provisional and finalized English captions with restrained screen-reader announcements and persistent final captions.
 - A Fastify REST/WebSocket service with runtime-validated shared TypeScript contracts.
-- Final-only transcription stabilization: a partial ASR hypothesis can never create an intent candidate or signing plan.
-- Deterministic language, length, domain, name/number, and high-stakes gates before model invocation.
-- A Google Speech-to-Text V2 adapter and an enum-only `gemini-3.6-flash` Structured Outputs classifier with no tools.
-- Mandatory staff confirmation, server-owned intent and asset IDs, catalog/hash/review/withdrawal checks, short-lived asset URLs, and captions-only failure behavior.
-- Same-origin cookie sessions, size/rate/concurrency limits, privacy-safe aggregate events, an admin metrics API, and a constrained daily operations report.
-- Cloud Run, Cloud Build, Firestore TTL, Cloud Scheduler, and immutable-digest production-promotion configuration.
-- Local/demo provenance labels that never represent scripted fixtures as Google Cloud, Gemini, ASL, or human-reviewed output.
+- Final-only speech stabilization: a partial ASR hypothesis can update the provisional caption but cannot create a reviewed intent or Hand Talk request.
+- Google Speech-to-Text V2, Vertex/Gemini Structured Outputs, private Cloud Storage, and Firestore adapters behind `USE_GOOGLE_CLOUD=true`.
+- A reviewed-lane deterministic language, length, domain, name/number, and consequential-use gate before the enum-only model call.
+- Mandatory staff confirmation, server-owned intent/asset IDs, catalog/hash/review/withdrawal checks, short-lived asset URLs, and captions-only failure behavior for reviewed media.
+- Authenticated avatar configuration, server authorization, and transcript-free execution-event routes plus a pinned Hand Talk 1.0.0 browser integration supporting `HUGO` or `MAYA`, ASL (`en-ase`), pause, resume, repeat, stop, and speed controls.
+- Same-origin cookie sessions, body/rate/concurrency limits, restrictive headers, privacy-safe aggregate events, an admin metrics API, and a constrained daily operations report.
+- Local/demo provenance labels that never represent fixtures as Google Cloud, Hand Talk, ASL, or human-reviewed output.
 
-The model choice is documented by Google's current [`gemini-3.6-flash` model page](https://ai.google.dev/gemini-api/docs/models/gemini-3.6-flash) and [Structured Outputs guidance](https://ai.google.dev/gemini-api/docs/structured-output). A deployed pilot must still retain evidence of the exact model actually executed.
-
-## Safety architecture
+## Architecture
 
 ```mermaid
 flowchart LR
-  mic["Microphone: 16 kHz mono PCM"] --> api["Same-origin API and WebSocket"]
-  upload["Audio upload: up to 60 seconds"] --> api
-  api --> stt["Cloud Speech-to-Text V2"]
-  stt --> final["Partial to final transcript state"]
-  final --> gate["Server-owned safety and domain gate"]
+  mic["Microphone: 16 kHz PCM"] --> api["Same-origin API and WebSocket"]
+  upload["Audio upload"] --> api
+  api --> stt["Google Speech-to-Text V2"]
+  stt --> partial["Partial: visual caption only"]
+  stt --> final["isFinal: persistent caption"]
+  typed["Typed English"] --> final
+
+  final --> gate["Reviewed-lane safety and domain gate"]
   gate --> gemini["Gemini: one enum candidate or unsupported"]
-  gemini --> staff["Mandatory staff confirmation"]
-  staff --> catalog["Published immutable catalog"]
-  catalog --> storage["Private video: short-lived signed URL"]
-  storage --> output["Whole ASL phrase plus final caption"]
+  gemini --> confirm["Staff confirmation"]
+  confirm --> catalog["Published reviewed catalog"]
+  catalog --> video["Human-recorded ASL video plus caption"]
+
+  final -->|"explicit avatar mode"| avatarGate["Consequential and identity-data gate"]
+  avatarGate --> avatarConfirm["Per-message staff confirmation"]
+  avatarConfirm --> sdk["Hand Talk SDK 1.0.0 in browser"]
+  sdk --> vendor["Third-party translation service"]
+  vendor --> avatar["Experimental WebGL avatar plus caption"]
+
   final --> fallback["Captions, typing, manual phrase, or human support"]
-  api --> events["Transcript-free aggregate events"]
-  events --> ops["Constrained daily operations report"]
-  signer["Deaf signer"] --> review["Independent Deaf ASL review"]
-  review --> evidence["Hash-bound rights and approval evidence"]
-  evidence --> catalog
 ```
 
-The browser never supplies candidate assets. Gemini can select only a server-defined intent or `unsupported`; its output is validated again on the server and cannot trigger playback. Every playable asset must be one complete utterance whose exact SHA-256 bytes, caption, rights record, and independent review are bound to a published catalog version.
+The reviewed path remains the production-safe target. In the experimental path, SignBridge authorizes only finalized or explicitly submitted text after a deterministic consequential/name/number gate and an explicit staff decision. The authenticated browser then receives the public-client vendor token and sends the authorized text to Hand Talk. SignBridge does not inspect or approve the generated linguistic output. See [architecture](docs/architecture.md), [linguistic safety](docs/linguistic-safety.md), and [privacy/security](docs/privacy-security.md).
 
 ## Run locally
 
@@ -53,7 +66,7 @@ The browser never supplies candidate assets. Gemini can select only a server-def
 
 - Node.js 24
 - pnpm 11.18.0, preferably through Corepack
-- Current Chrome or Edge for the installed-browser suites
+- Current Chrome or Edge; WebGL is additionally required for the vendor avatar
 
 ```powershell
 corepack enable
@@ -63,11 +76,52 @@ pnpm dev
 
 Open `http://127.0.0.1:4173`. The API listens on `http://127.0.0.1:8080`, and Vite proxies same-origin `/api` traffic during development.
 
-Choose **Explore local demo** for the scripted, non-cloud walkthrough. To enter the local-safe staff shell, the development-only access code is `signbridge-demo`. Local-safe mode deliberately has no speech provider, Gemini execution, or playable ASL media, so those paths fall back instead of fabricating results.
+Choose **Explore local demo** for the scripted, non-cloud walkthrough. The development-only access code is `signbridge-demo`. Local-safe mode has no speech provider, Gemini execution, reviewed ASL media, or Hand Talk provider output and must not be represented otherwise.
 
-Configuration defaults are defined in the API and summarized in [`.env.example`](.env.example). The application does not automatically load that file: set environment variables in the shell, secret manager, or Cloud Run configuration. Never reuse the example/default access codes or session secret in production.
+The application does not automatically load `.env.example`. Set environment variables in the shell, Secret Manager/Cloud Run configuration, or another approved runtime mechanism. Never use the example access codes or session secret in production.
 
-## Verify the implementation
+## Exact provider configuration
+
+### Google Cloud lane
+
+Set:
+
+```text
+USE_GOOGLE_CLOUD=true
+GOOGLE_CLOUD_PROJECT=<project-id>
+GOOGLE_CLOUD_LOCATION=<Vertex location, currently defaulting to global>
+GOOGLE_SPEECH_LOCATION=<recognizer location, currently defaulting to global>
+GOOGLE_SPEECH_RECOGNIZER=<recognizer ID or _>
+GOOGLE_SPEECH_MODEL=<deployed model, currently configured as chirp_3>
+GEMINI_MODEL=<Vertex publisher model available in that project/location>
+SIGN_ASSET_BUCKET=<private bucket name>
+FIRESTORE_DATABASE=<database ID>
+```
+
+`GOOGLE_CLOUD_PROJECT` and `SIGN_ASSET_BUCKET` are mandatory when cloud mode is enabled. Google client libraries use Application Default Credentials:
+
+- on Cloud Run, attach a least-privilege service account with only the required Speech-to-Text, Vertex AI, bucket-signing/read, and Firestore permissions;
+- for an authorized local smoke test, use `gcloud auth application-default login`, or set `GOOGLE_APPLICATION_CREDENTIALS` to a narrowly scoped service-account file stored outside Git.
+
+Do not paste access tokens or service-account JSON into this repository. The default `GEMINI_MODEL=gemini-3.6-flash` is a configuration value, not proof that the model is available through Vertex in the chosen project/location. Confirm it with an authorized minimal request before deployment.
+
+### Experimental Hand Talk lane
+
+Set:
+
+```text
+HANDTALK_TOKEN=<contracted fixed-channel browser SDK token>
+HANDTALK_SDK_URL=https://api-cdn.handtalk.me/sdk/1.0.0/ht-api-sdk.min.js
+HANDTALK_AVATAR=HUGO
+```
+
+`HANDTALK_AVATAR` may be `HUGO` or `MAYA`. The code accepts only an official, fixed semantic-version HTTPS SDK URL and uses `enUS` input with ASL `en-ase`, limited to 1,000 characters. Hand Talk's official [quick start](https://api-docs.handtalk.me/v1/en/javascript/getting-start) documents token-based browser initialization and `translate()`. Its [release-channel guide](https://api-docs.handtalk.me/v1/en/javascript/release-channels) says fixed versions avoid forced updates and that beta and fixed/latest channels use different tokens. The [SDK introduction](https://api-docs.handtalk.me/beta/en/introduction) documents WebGL and input-length limits.
+
+When configured, the API returns the Hand Talk token to the authenticated browser with `Cache-Control: no-store`, because the vendor SDK requires a client-side token. Treat it as a public-client credential: require exact-origin restrictions, separate staging/production tokens, quotas, rotation, revocation, and monitoring. It must never double as a server or administrative credential.
+
+Do not enter pilot/customer text until Hand Talk supplies executed commercial terms for this use, SDK/token scope, allowed origins, contest/customer rights, an SDK-specific DPA, retention/deletion and subprocessors, hosting regions, incident response, SLA/support, and token revocation. No such agreement is included in this repository.
+
+## Verification
 
 ```powershell
 pnpm verify
@@ -76,89 +130,88 @@ pnpm exec playwright test --project=msedge
 pnpm audit --prod --audit-level=high
 ```
 
-`pnpm verify` checks LF line endings, likely committed secrets, TypeScript, unit tests, catalog invariants, and both production builds. Browser tests exercise mocked mic/WebSocket/upload/playback success and failure paths; they do not prove real provider execution or ASL comprehension.
+`pnpm verify` checks line endings, likely committed secrets, TypeScript, unit tests, catalog invariants, and production builds. Browser tests use controlled providers; they cannot establish ASL accuracy or real provider execution.
 
-Latest local evidence on 2026-08-01:
+The last recorded baseline on 2026-08-01—before the experimental Hand Talk working-tree changes—passed TypeScript, 87 unit tests, catalog validation, both builds, 19 Chrome E2E checks, and 19 Edge E2E checks. It found no serious or critical Axe issue in the tested route and no critical/high production dependency advisory; one moderate transitive `uuid` advisory remained in the Google Cloud Storage tree. Those results must not be reported as validation of the final hybrid build until the suites are rerun.
 
-| Gate | Result |
-| --- | --- |
-| TypeScript, catalog validation, web/API production builds | Passed |
-| Unit tests | 87 passed across 14 files |
-| Installed Google Chrome E2E | 19 passed |
-| Installed Microsoft Edge E2E | 19 passed |
-| Automated accessibility | No serious or critical Axe findings in the tested route; keyboard, 320 px reflow, 200% equivalent zoom, forced colors, and reduced motion covered |
-| Production dependency audit | 0 critical/high advisories; 1 moderate transitive `uuid` advisory remains in the Google Cloud Storage dependency tree |
+Still unverified: a real Hand Talk token and generated output, Google ADC, live Speech-to-Text/Gemini calls, deployed cloud revision, real microphone hardware, container build, Linux CI, manual NVDA behavior, reviewed ASL presentation, provider privacy behavior, commercial rights, and Deaf-user comprehension. The [claims ledger](docs/claims-ledger.md) is authoritative.
 
-Not yet evaluated locally: the container image (Docker was unavailable), Linux CI, real microphone hardware/provider calls, Google Cloud deployment, manual NVDA behavior, ASL media presentation, or human comprehension.
+## Public API
 
-See the [public claims ledger](docs/claims-ledger.md) for what these results establish—and what they do not.
-
-## Public API surface
-
-All product routes are same-origin. Site and admin routes use a short-lived HttpOnly session cookie.
+All product routes are same-origin. Site/admin routes use a short-lived HttpOnly session cookie.
 
 | Interface | Purpose |
 | --- | --- |
-| `POST /api/session/exchange` | Exchange a site/admin access code for a cookie session; the site ID is server-owned |
-| `WS /api/live-transcription` | Receive configuration then binary PCM; emit partial, final, candidate, fallback, error, and speech-end events |
-| `POST /api/audio/transcribe` | Validate and transcribe WAV, MP3, or WebM up to 10 MB and 60 seconds through the same finalization/classification pipeline |
-| `POST /api/utterances/:id/decision` | Consume one pending candidate as `play` or `fallback`; verify the current catalog before returning any asset URL |
-| `GET /api/catalog` | Return public intent descriptions, availability, language pack, and catalog version—never private rights/storage records |
-| `POST /api/playback-events` | Accept authorized start/completion/failure evidence for a server-issued playback grant |
-| `POST /api/feedback` | Accept predefined category and severity without transcript or unrestricted free text |
-| `GET /api/admin/metrics` | Return protected aggregate usage, latency, fallback, rejection, playback, and operations-job metrics |
-| `GET /api/health` | Report runtime mode, service/revision/SHA, configured models, catalog version, and playback state |
-| `POST /api/internal/operations/daily` | OIDC-protected aggregate operations analysis; cannot publish content, contact customers, or change the catalog |
+| `POST /api/session/exchange` | Exchange a site/admin access code for a cookie session |
+| `GET /api/avatar/config` | Return no-store experimental avatar configuration after site authentication; returns no token when disabled |
+| `POST /api/avatar/authorize` | Require explicit staff confirmation and run the deterministic avatar gate before releasing text to the browser SDK |
+| `POST /api/avatar/events` | Record structured start/completion/failure evidence without transcript text |
+| `WS /api/live-transcription` | Receive PCM and emit partial, final, reviewed candidate, fallback, error, and speech-end events |
+| `POST /api/audio/transcribe` | Validate/transcribe WAV, MP3, or WebM up to 10 MB and 60 seconds |
+| `POST /api/utterances/:id/decision` | Confirm or reject one reviewed-lane candidate and verify the published catalog |
+| `GET /api/catalog` | Return public intent descriptions and availability, never private rights/storage records |
+| `POST /api/playback-events` | Accept authorized reviewed-media playback evidence |
+| `POST /api/feedback` | Accept predefined category/severity without transcript or free text |
+| `GET /api/admin/metrics` | Return protected aggregate operational metrics |
+| `GET /api/health` | Report runtime, revision, configured Google model strings, catalog, and playback state |
+| `POST /api/internal/operations/daily` | OIDC-protected aggregate analysis that cannot publish content or contact customers |
 
-The schemas live in [`packages/contracts`](packages/contracts), and the behavior is covered by unit/integration tests under [`tests`](tests) and package-local test files.
+Hand Talk translation calls do not pass through a SignBridge server route; the browser SDK communicates with the vendor after configuration.
 
 ## Content publication gate
 
-The ten bounded reception intents are declared in [`content/catalog/catalog.v1.draft.json`](content/catalog/catalog.v1.draft.json). This draft is intentionally non-playable.
+The ten bounded reception intents in [`content/catalog/catalog.v1.draft.json`](content/catalog/catalog.v1.draft.json) are intentionally non-playable. Before publishing reviewed media, humans must:
 
-Before changing any catalog to `published`, humans must:
-
-1. Lock the exact intent meaning with the pilot customer, Deaf signer, and independent Deaf ASL reviewer.
+1. Lock each exact meaning with the pilot customer, Deaf signer, and independent Deaf ASL reviewer.
 2. Obtain compensation, consent, commercial hosting, contest/judge, and applicable publicity rights.
 3. Record complete 1080p/30 fps utterances with face, torso, hands, and signing space visible; never crop, mirror, splice, or synthesize them.
-4. Bind reviewer approval and rights references to each exact file hash and catalog version outside Git.
-5. Upload immutable private objects, verify their generations and hashes, and pass `pnpm catalog:verify`.
-6. Publish through a named human release authority. Corrections create new versions; withdrawal immediately blocks new signed URLs while preserving the audit trail.
+4. Bind reviewer approval and rights references to each exact SHA-256 file and catalog version outside Git.
+5. Upload immutable private objects, verify generations and hashes, and pass `pnpm catalog:verify`.
+6. Publish through a named human authority; corrections create new versions and withdrawal blocks new signed URLs.
 
-Follow [content and rights](docs/content-and-rights.md), the [recording guide](docs/recording-guide.md), and the [linguistic safety contract](docs/linguistic-safety.md). Engineering does not author or approve ASL translations.
+Engineering does not author or approve ASL translations. These guarantees apply only to reviewed catalog assets, never to Hand Talk output.
+
+## Experimental-lane release blockers
+
+Before enabling the avatar for any market pilot:
+
+- close the vendor contract, DPA, retention, subprocessor, region, SLA, origin, quota, rotation, and revocation questions;
+- execute a real staging smoke test with the fixed token/SDK and record network, error, latency, and control behavior;
+- commission independent compensated Deaf ASL experts and users to evaluate the exact provider version/avatar on unseen inputs;
+- retain captions and an immediate human-support route;
+- exclude all consequential use even if average evaluation results appear strong;
+- publish only bounded, measured findings—never “unrestricted accurate interpretation.”
+
+The [evaluation plan](docs/evaluation-plan.md) defines separate gates for reviewed and experimental output.
 
 ## Cloud deployment
 
-[`infra/cloudbuild.yaml`](infra/cloudbuild.yaml) builds and verifies an exact commit before deploying the staging service. The current pilot configuration intentionally caps Cloud Run at **one instance** because confirmation, playback-grant, and live-concurrency state are process-local. Do not raise the cap until those controls use transactional distributed state and pass restart/failover tests.
+[`infra/cloudbuild.yaml`](infra/cloudbuild.yaml) builds and verifies an exact commit before staging deployment. The pilot remains capped at one Cloud Run instance because confirmation, playback-grant, and live-concurrency state are process-local. Do not raise the cap until those controls use transactional distributed state and pass restart/failover tests.
 
-The deployment operator must create the Google Cloud project, billing controls, least-privilege service accounts, private bucket, Firestore database/TTL policy, secrets, custom origin, and scheduler identity. Rehearse the exact revision and catalog in staging, then use [`infra/promote-production.ps1`](infra/promote-production.ps1) with an immutable image digest and verified commit SHA. Full prerequisites are in [`infra/README.md`](infra/README.md).
+The operator must configure billing alerts, least-privilege service identities, private storage, Firestore/TTL, secrets, custom origin, scheduler identity, Hand Talk origin restrictions, and separate provider credentials. Rehearse the exact code revision, catalog, Google models, and Hand Talk SDK/token channel in staging. See [`infra/README.md`](infra/README.md).
 
 ## Repository map
 
 ```text
-apps/web/                React/Vite reception interface
-packages/contracts/      Shared Zod contracts, intents, catalog, safety rules
+apps/web/                React/Vite interface and Hand Talk WebGL host
+packages/contracts/      Shared Zod contracts, catalog, safety, avatar config
 services/api/            Fastify REST/WebSocket service and Google adapters
 content/catalog/         Versioned, currently non-playable phrase catalog
-tests/                   Cross-package unit/integration and Playwright tests
-infra/                   Container, Cloud Build, TTL, scheduler, promotion scripts
-docs/                    Safety, rights, accessibility, evaluation, pilot, operations
-scripts/                 Catalog, line-ending, and secret-pattern release checks
+tests/                   Cross-package and Playwright tests
+infra/                   Container, Cloud Build, TTL, scheduler, promotion
+docs/                    Safety, rights, privacy, evaluation, pilot, operations
+scripts/                 Catalog, line-ending, and secret-pattern checks
 ```
 
-## Pilot and submission evidence
+## Evidence and provenance
 
-- [`docs/release-checklist.md`](docs/release-checklist.md) is the authoritative launch gate.
-- [`docs/evaluation-plan.md`](docs/evaluation-plan.md) defines the gold-audio and quantitative acceptance plan.
-- [`docs/accessibility.md`](docs/accessibility.md) separates automation from manual assistive-technology and Deaf-user acceptance.
-- [`docs/privacy-security.md`](docs/privacy-security.md) documents data boundaries and deployment checks.
-- [`docs/pilot-runbook.md`](docs/pilot-runbook.md) and [`docs/operations-runbook.md`](docs/operations-runbook.md) cover staff operation and incident fallback.
-- [`docs/pilot-evidence-kit.md`](docs/pilot-evidence-kit.md) identifies consent-safe customer, payment, cost, model-execution, and results evidence.
-- [`DEVPOST_SUBMISSION.md`](DEVPOST_SUBMISSION.md) is a copy-ready evidence template with required fields, not a completed submission.
-- [`CODEX_USAGE.md`](CODEX_USAGE.md) records what Codex did and did not do.
+- [`docs/release-checklist.md`](docs/release-checklist.md) is the existing launch gate and must be reconciled with the newer hybrid boundary before launch.
+- [`docs/evaluation-plan.md`](docs/evaluation-plan.md) separates reviewed and experimental acceptance.
+- [`docs/privacy-security.md`](docs/privacy-security.md) documents Google and Hand Talk data/credential boundaries.
+- [`docs/claims-ledger.md`](docs/claims-ledger.md) states what may be claimed today.
+- [`CODEX_USAGE.md`](CODEX_USAGE.md) records Codex's actual role and non-actions.
+- [`DEVPOST_SUBMISSION.md`](DEVPOST_SUBMISSION.md) remains an evidence template, not a completed submission.
 
-The default pilot offer is **$500 setup and validation plus $99 per location per month**, invoiced outside the application. It is a proposed price—not evidence of a sale. Do not claim a paid pilot, production AI, linguistic approval, customer impact, or market readiness until the corresponding retained evidence closes the checklist.
+The proposed price of $500 setup/validation plus $99 per location per month is not evidence of a sale. Do not claim a paid pilot, production AI, linguistic approval, customer impact, or market readiness without retained proof.
 
-## Provenance
-
-This is a new repository. [`PREEXISTING_ASSETS.md`](PREEXISTING_ASSETS.md) records the selective conceptual reuse from Apache-2.0-licensed [`Omarzaf/signbridge-overlay`](https://github.com/Omarzaf/signbridge-overlay) at commit `0f68661a705068f0f9cfd79f437f435cc723bdf6`. No upstream authoring service, synthetic PWA, extension, deterministic gloss matcher, video-sync engine, signing corpus, media, or reviewer approval was imported.
+This is a new repository. [`PREEXISTING_ASSETS.md`](PREEXISTING_ASSETS.md) records selective conceptual reuse from Apache-2.0-licensed [`Omarzaf/signbridge-overlay`](https://github.com/Omarzaf/signbridge-overlay) at commit `0f68661a705068f0f9cfd79f437f435cc723bdf6`. No upstream signing corpus, media, reviewer approval, authoring service, extension, deterministic gloss matcher, or video-sync engine was imported.

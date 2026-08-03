@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SpeechProvider } from "./adapters/speech.js";
-import { authenticate, makeTestApp } from "./test-helpers.js";
+import { authenticate, makeTestApp, supportedClassifier } from "./test-helpers.js";
 
 const apps: Array<Awaited<ReturnType<typeof makeTestApp>>["app"]> = [];
 afterEach(async () => Promise.all(apps.splice(0).map((app) => app.close())));
@@ -65,6 +65,39 @@ describe("uploaded-audio route limits and fallback mapping", () => {
     const terminals = events.events.filter((event) => event.type === "transcription_completed");
     expect(terminals).toHaveLength(1);
     expect(terminals[0]?.fallbackReason).toBe("transcript_too_long");
+  });
+
+  it("still classifies a finalized upload when Hand Talk is configured", async () => {
+    const classifier = supportedClassifier();
+    const classify = vi.spyOn(classifier, "classify");
+    const transcribeUpload = vi.fn(async () => [
+      {
+        id: randomUUID(),
+        text: "Welcome",
+        isFinal: true,
+        startedAtMs: 0,
+        endedAtMs: 1_000,
+        provider: "google-cloud-speech" as const,
+        model: "chirp_3",
+      },
+    ]);
+    const { app } = await makeTestApp({
+      config: { handtalkToken: "configured-handtalk-token" },
+      classifier,
+      speech: speechWith(transcribeUpload),
+    });
+    apps.push(app);
+    const login = await authenticate(app);
+
+    const response = await upload(app, login.cookie, "audio/wav", makeWav(8_000));
+
+    expect(response.statusCode).toBe(200);
+    expect(classify).toHaveBeenCalledOnce();
+    expect(classify).toHaveBeenCalledWith("Welcome");
+    expect(response.json()).toMatchObject({
+      stableUtterances: [{ transcript: "Welcome" }],
+      detectedIntents: [{ status: "supported", intentId: "greeting" }],
+    });
   });
 
   it("protects the scheduled operations route from unauthenticated callers", async () => {

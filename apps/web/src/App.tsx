@@ -11,37 +11,46 @@ import {
 } from "react";
 import {
   ApiError,
+  authorizeAvatar,
   endSession,
   exchangeSession,
   loadCatalog,
+  loadAvatarConfig,
   loadMetrics,
+  reportAvatarExecution,
   reportPlayback,
   sendFeedback,
   submitDecision,
   transcribeAudio,
   type SessionInfo,
 } from "./api.js";
+import { HandTalkAvatar, type HandTalkAvatarHandle } from "./avatar/HandTalkAvatar.js";
 import { classifyDemoTranscript, DEMO_CATALOG, DEMO_TRANSCRIPT, getIntent, validateAudioFile } from "./demo.js";
 import { LiveTranscriptionSocket } from "./liveTranscription.js";
 import { PcmMicrophone } from "./microphone.js";
 import type {
+  AvatarPlaybackState,
+  AvatarMessageSource,
+  AvatarRuntimeConfig,
+  AvatarTranslationRequest,
   DashboardMetrics,
   ExperienceMode,
   InputMethod,
   IntentCandidate,
   LiveCaptionEvent,
   PlaybackAsset,
+  PendingAvatarMessage,
   PublicCatalog,
   RuntimeMode,
 } from "./models.js";
 
 type ConnectionState = "idle" | "connecting" | "connected" | "offline";
-type ProcessState = "idle" | "preparing" | "listening" | "finalizing" | "classifying" | "candidate" | "fallback" | "playing";
+type ProcessState = "idle" | "preparing" | "listening" | "finalizing" | "classifying" | "candidate" | "avatar_confirmation" | "fallback" | "playing";
 
 const INPUT_TABS: Array<{ id: InputMethod; label: string; detail: string }> = [
   { id: "speak", label: "Speak", detail: "Push to talk" },
   { id: "upload", label: "Upload", detail: "Audio file" },
-  { id: "type", label: "Type", detail: "Caption directly" },
+  { id: "type", label: "Type", detail: "English message" },
   { id: "phrases", label: "Phrases", detail: "Select manually" },
 ];
 
@@ -60,6 +69,18 @@ const FALLBACK_COPY: Record<string, string> = {
   staff_rejected: "Staff chose not to play a signing video. The English caption remains available.",
   typed_caption: "Typed messages stay as English captions and are not translated automatically.",
   manual_caption: "This manual phrase is displayed as a caption. No signing video has been requested.",
+  avatar_unavailable: "The experimental ASL avatar is not configured for this site. Keep the caption visible or use the reviewed phrase lane.",
+  avatar_error: "The experimental ASL avatar could not complete this message. Keep the English caption visible.",
+};
+
+const DISABLED_AVATAR_CONFIG: AvatarRuntimeConfig = {
+  provider: "handtalk",
+  enabled: false,
+  status: "experimental",
+  avatar: "HUGO",
+  language: "enUS",
+  signLanguage: "en-ase",
+  maxCharacters: 1_000,
 };
 
 export function App(): ReactNode {
@@ -68,7 +89,7 @@ export function App(): ReactNode {
   const [view, setView] = useState<"reception" | "metrics">("reception");
   const [catalog, setCatalog] = useState<PublicCatalog>(DEMO_CATALOG);
   const [catalogMessage, setCatalogMessage] = useState("");
-  const [mode, setMode] = useState<ExperienceMode>("asl_captions");
+  const [mode, setMode] = useState<ExperienceMode>("captions_only");
   const [inputMethod, setInputMethod] = useState<InputMethod>("speak");
   const [connection, setConnection] = useState<ConnectionState>("idle");
   const [processState, setProcessState] = useState<ProcessState>("idle");
@@ -88,16 +109,30 @@ export function App(): ReactNode {
   const [metricsError, setMetricsError] = useState("");
   const [showFeedback, setShowFeedback] = useState(false);
   const [feedbackSent, setFeedbackSent] = useState(false);
+  const [avatarConfig, setAvatarConfig] = useState<AvatarRuntimeConfig | null>(DISABLED_AVATAR_CONFIG);
+  const [avatarActivationAcknowledged, setAvatarActivationAcknowledged] = useState(false);
+  const [avatarActivated, setAvatarActivated] = useState(false);
+  const [pendingAvatarMessage, setPendingAvatarMessage] = useState<PendingAvatarMessage | null>(null);
+  const [avatarRequest, setAvatarRequest] = useState<AvatarTranslationRequest | null>(null);
+  const [avatarState, setAvatarState] = useState<AvatarPlaybackState>("unavailable");
 
   const microphoneRef = useRef(new PcmMicrophone());
   const socketRef = useRef<LiveTranscriptionSocket | null>(null);
   const finalReceivedRef = useRef(false);
+  const finalTranscriptRef = useRef("");
   const finalTimerRef = useRef<number | null>(null);
   const responseTimerRef = useRef<number | null>(null);
   const captureDeadlineTimerRef = useRef<number | null>(null);
   const microphoneOpenedAtRef = useRef<number | null>(null);
   const demoPartialTimerRef = useRef<number | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const avatarRef = useRef<HandTalkAvatarHandle | null>(null);
+  const avatarExecutionRef = useRef<{
+    authorizationId: string;
+    authorizedAt: number;
+    started: boolean;
+    terminal: boolean;
+  } | null>(null);
   const confirmationRef = useRef<HTMLElement | null>(null);
   const workGenerationRef = useRef(0);
   const stopRequestedRef = useRef(false);
@@ -110,6 +145,7 @@ export function App(): ReactNode {
     socketRef.current = null;
     void microphoneRef.current.stop().catch(() => undefined);
     videoRef.current?.pause();
+    void avatarRef.current?.stop().catch(() => undefined);
     if (finalTimerRef.current !== null) {
       window.clearTimeout(finalTimerRef.current);
       finalTimerRef.current = null;
@@ -163,6 +199,7 @@ export function App(): ReactNode {
         "fallback",
       ).catch(() => undefined);
     }
+    avatarExecutionRef.current = null;
     cancelActiveWork();
     setProvisional("");
     setFinalCaption("");
@@ -174,8 +211,80 @@ export function App(): ReactNode {
     setProcessState("idle");
     setShowFeedback(false);
     setFeedbackSent(false);
+    setPendingAvatarMessage(null);
+    setAvatarRequest(null);
     finalReceivedRef.current = false;
+    finalTranscriptRef.current = "";
   }, [cancelActiveWork, candidate, runtime]);
+
+  const prepareAvatarMessage = useCallback((text: string, source: AvatarMessageSource) => {
+    const normalized = text.trim();
+    if (!normalized) {
+      setPendingAvatarMessage(null);
+      setAvatarRequest(null);
+      setFallbackReason("empty_transcript");
+      setProcessState("fallback");
+      return;
+    }
+    setFinalCaption(normalized);
+    setCandidate(null);
+    setAsset(null);
+    setPendingAvatarMessage(null);
+    setAvatarRequest(null);
+    setError("");
+    if (mode !== "avatar_captions" || !avatarActivated) {
+      setFallbackReason("captions_only_selected");
+      setProcessState("fallback");
+      setNotice("The final caption is ready. The experimental avatar was not activated, so no provider request was made.");
+      return;
+    }
+    if (!avatarConfig?.enabled) {
+      setFallbackReason("avatar_unavailable");
+      setProcessState("fallback");
+      setNotice("The experimental avatar is not configured. The English caption remains available.");
+      return;
+    }
+    setFallbackReason("");
+    setPendingAvatarMessage({ id: crypto.randomUUID(), text: normalized, source });
+    setProcessState("avatar_confirmation");
+    setNotice("Review the final caption. Nothing is sent to Hand Talk until staff confirms this message.");
+  }, [avatarActivated, avatarConfig?.enabled, mode]);
+
+  const handleAvatarStateChange = useCallback((next: AvatarPlaybackState) => {
+    setAvatarState(next);
+    const execution = avatarExecutionRef.current;
+    if (!execution) return;
+    const latencyMs = Math.min(
+      120_000,
+      Math.max(0, Math.round(performance.now() - execution.authorizedAt)),
+    );
+    if (next === "translating" && !execution.started) {
+      execution.started = true;
+      void reportAvatarExecution({
+        authorizationId: execution.authorizationId,
+        result: "started",
+        latencyMs,
+      }).catch(() => undefined);
+      return;
+    }
+    if (next === "ready" && execution.started && !execution.terminal) {
+      execution.terminal = true;
+      void reportAvatarExecution({
+        authorizationId: execution.authorizationId,
+        result: "completed",
+        latencyMs,
+      }).catch(() => undefined);
+      return;
+    }
+    if (next === "error" && !execution.terminal) {
+      execution.terminal = true;
+      void reportAvatarExecution({
+        authorizationId: execution.authorizationId,
+        result: "failed",
+        latencyMs,
+      }).catch(() => undefined);
+    }
+  }, []);
 
   const applyCandidate = useCallback((next: IntentCandidate, transcriptOverride?: string) => {
     const intent = next.intentId ? getIntent(next.intentId, catalog) : undefined;
@@ -189,7 +298,7 @@ export function App(): ReactNode {
     if (!enriched.supported) {
       setFallbackReason(enriched.reasonCode);
       setProcessState("fallback");
-    } else if (mode === "captions_only") {
+    } else if (mode !== "asl_captions") {
       setFallbackReason("captions_only_selected");
       setProcessState("fallback");
       setNotice("Captions-only mode is active. No signing video will be requested.");
@@ -210,16 +319,35 @@ export function App(): ReactNode {
         finalTimerRef.current = null;
       }
       setProvisional("");
-      setFinalCaption((current) => event.text
-        ? current ? `${current} ${event.text}` : event.text
-        : current);
+      if (event.text) {
+        finalTranscriptRef.current = finalTranscriptRef.current
+          ? `${finalTranscriptRef.current} ${event.text}`
+          : event.text;
+        setFinalCaption(finalTranscriptRef.current);
+      }
       setProcessState((current) => current === "finalizing" || current === "classifying"
         ? "classifying"
         : current);
       return;
     }
+    if (event.type === "speech_end") {
+      terminateLiveAttempt();
+      if (!finalReceivedRef.current) return;
+      if (mode === "avatar_captions") {
+        prepareAvatarMessage(finalTranscriptRef.current, "speech");
+      } else if (mode === "captions_only") {
+        setFallbackReason("captions_only_selected");
+        setProcessState("fallback");
+        setNotice("The final caption is ready. No avatar request was made.");
+      }
+      return;
+    }
     if (event.type === "candidate" && event.candidate) {
       terminateLiveAttempt();
+      if (mode === "avatar_captions" && finalReceivedRef.current) {
+        prepareAvatarMessage(finalTranscriptRef.current || event.text || "", "speech");
+        return;
+      }
       applyCandidate(event.candidate, event.text);
       return;
     }
@@ -232,10 +360,14 @@ export function App(): ReactNode {
     }
     if (event.type === "fallback") {
       terminateLiveAttempt();
+      if (mode === "avatar_captions" && finalReceivedRef.current) {
+        prepareAvatarMessage(finalTranscriptRef.current, "speech");
+        return;
+      }
       setFallbackReason(event.code ?? "unknown_intent");
       setProcessState("fallback");
     }
-  }, [applyCandidate, terminateLiveAttempt]);
+  }, [applyCandidate, mode, prepareAvatarMessage, terminateLiveAttempt]);
 
   useEffect(() => {
     handleLiveEventRef.current = handleLiveEvent;
@@ -266,6 +398,36 @@ export function App(): ReactNode {
     };
   }, [runtime, session]);
 
+  useEffect(() => {
+    if (!session) return;
+    if (runtime === "demo" || mode !== "avatar_captions" || !avatarActivated) {
+      setAvatarConfig(DISABLED_AVATAR_CONFIG);
+      setAvatarState("unavailable");
+      return;
+    }
+    let active = true;
+    setAvatarConfig(null);
+    setAvatarState("loading");
+    loadAvatarConfig()
+      .then((config) => {
+        if (!active) return;
+        setAvatarConfig(config);
+        setAvatarState(config.enabled ? "loading" : "unavailable");
+        setNotice(config.enabled
+          ? "Experimental avatar access is available. Every final message still requires separate staff confirmation."
+          : "The experimental avatar provider is not configured. Captions and reviewed phrases remain available.");
+      })
+      .catch(() => {
+        if (!active) return;
+        setAvatarConfig(DISABLED_AVATAR_CONFIG);
+        setAvatarState("unavailable");
+        setNotice("The experimental avatar configuration could not be loaded. Captions remain available.");
+      });
+    return () => {
+      active = false;
+    };
+  }, [avatarActivated, mode, runtime, session]);
+
   useEffect(() => () => {
     workGenerationRef.current += 1;
     socketRef.current?.close();
@@ -278,7 +440,7 @@ export function App(): ReactNode {
   }, []);
 
   useEffect(() => {
-    if (processState === "candidate") confirmationRef.current?.focus();
+    if (processState === "candidate" || processState === "avatar_confirmation") confirmationRef.current?.focus();
   }, [processState]);
 
   useEffect(() => {
@@ -409,6 +571,10 @@ export function App(): ReactNode {
     responseTimerRef.current = window.setTimeout(() => {
       if (generation !== workGenerationRef.current) return;
       terminateLiveAttempt();
+      if (mode === "avatar_captions" && finalTranscriptRef.current) {
+        prepareAvatarMessage(finalTranscriptRef.current, "speech");
+        return;
+      }
       setFallbackReason("classification_timeout");
       setProcessState("fallback");
       setNotice("The finalized caption remains available, but phrase selection timed out. Use captions or try again.");
@@ -436,7 +602,9 @@ export function App(): ReactNode {
       setProvisional("");
       setFinalCaption(DEMO_TRANSCRIPT);
       demoPartialTimerRef.current = window.setTimeout(() => {
-        if (generation === workGenerationRef.current) applyCandidate(classifyDemoTranscript(DEMO_TRANSCRIPT));
+        if (generation !== workGenerationRef.current) return;
+        if (mode === "avatar_captions") prepareAvatarMessage(DEMO_TRANSCRIPT, "speech");
+        else applyCandidate(classifyDemoTranscript(DEMO_TRANSCRIPT));
       }, 500);
       return;
     }
@@ -470,7 +638,8 @@ export function App(): ReactNode {
       demoPartialTimerRef.current = window.setTimeout(() => {
         if (generation !== workGenerationRef.current) return;
         setFinalCaption("Please wait here.");
-        applyCandidate(classifyDemoTranscript("Please wait here."));
+        if (mode === "avatar_captions") prepareAvatarMessage("Please wait here.", "upload");
+        else applyCandidate(classifyDemoTranscript("Please wait here."));
         setUploading(false);
       }, 700);
       return;
@@ -479,7 +648,11 @@ export function App(): ReactNode {
       const result = await transcribeAudio(file);
       if (generation !== workGenerationRef.current) return;
       setFinalCaption(result.transcript);
-      applyCandidate(result.candidate, result.transcript);
+      if (mode === "avatar_captions") {
+        prepareAvatarMessage(result.transcript, "upload");
+      } else {
+        applyCandidate(result.candidate, result.transcript);
+      }
     } catch (uploadError) {
       if (generation !== workGenerationRef.current) return;
       setError(formatError(uploadError));
@@ -496,14 +669,20 @@ export function App(): ReactNode {
     if (!text) return;
     resetUtterance();
     setFinalCaption(text);
-    if (runtime === "demo") {
+    if (mode === "avatar_captions") {
+      prepareAvatarMessage(text, "type");
+    } else if (runtime === "demo") {
       applyCandidate(classifyDemoTranscript(text), text);
       setNotice(mode === "captions_only"
         ? "Captions-only mode is active. Local demo classifier used deterministic browser rules only; Gemini was not called."
         : "Local demo classifier: deterministic browser rules only; Gemini was not called.");
     } else {
+      setCandidate(null);
       setFallbackReason("typed_caption");
       setProcessState("fallback");
+      setNotice(mode === "captions_only"
+        ? "Captions-only mode is active. The English message was not sent for signing."
+        : "Typed messages remain captions in the reviewed-phrase lane. Choose a published phrase or use finalized speech.");
     }
   }
 
@@ -511,38 +690,61 @@ export function App(): ReactNode {
     const intent = getIntent(selectedPhrase, catalog);
     if (!intent) return;
     resetUtterance();
+    if (mode === "avatar_captions") {
+      prepareAvatarMessage(intent.caption, "phrase");
+      return;
+    }
     setFinalCaption(intent.caption);
     setFallbackReason("manual_caption");
     setProcessState("fallback");
     setNotice(runtime === "demo"
-      ? "Local demo: selected from an illustrative catalog. No published or reviewed ASL asset was requested."
+      ? "Local demo: selected from an illustrative catalog. No cloud avatar or reviewed ASL asset was requested."
       : "Selected from the published phrase list. This fallback displays the English caption only.");
   }
 
-  function selectExperienceMode(nextMode: ExperienceMode): void {
-    setMode(nextMode);
-    if (nextMode !== "captions_only") return;
+  function activateAvatarMode(): void {
+    if (mode !== "avatar_captions" || !avatarActivationAcknowledged) return;
+    setAvatarActivated(true);
+    setAvatarConfig(null);
+    setAvatarState("loading");
+    setNotice("Checking the contracted avatar provider. No message text has been sent.");
+  }
 
+  function selectExperienceMode(nextMode: ExperienceMode): void {
+    if (nextMode === mode) return;
+    setMode(nextMode);
+    setAvatarActivationAcknowledged(false);
+    setAvatarActivated(false);
+    setAvatarConfig(DISABLED_AVATAR_CONFIG);
+    setAvatarState("unavailable");
     cancelActiveWork();
     videoRef.current?.pause();
+    avatarExecutionRef.current = null;
+    void avatarRef.current?.stop().catch(() => undefined);
     setAsset(null);
+    setPendingAvatarMessage(null);
+    setAvatarRequest(null);
     if (candidate && runtime === "live") {
       void submitDecision(candidate.utteranceId, candidate.detectedIntentId, "fallback").catch(
         () => undefined,
       );
     }
     setCandidate(null);
-    if (finalCaption || processState === "candidate" || processState === "playing") {
-      setFallbackReason("captions_only_selected");
+    if (finalCaption || processState === "candidate" || processState === "avatar_confirmation" || processState === "playing") {
+      setFallbackReason(nextMode === "captions_only" ? "captions_only_selected" : "staff_rejected");
       setProcessState("fallback");
-      setNotice("Captions-only mode is active. No signing video will be requested.");
     }
+    setNotice(nextMode === "captions_only"
+      ? "Captions-only mode is active. No signing video will be requested."
+      : nextMode === "asl_captions"
+        ? "Reviewed ASL mode is active. Only a supported published phrase can be offered for staff approval."
+        : "Before using the experimental avatar, record the visitor’s choice and activate provider access below.");
   }
 
   async function decide(decision: "play" | "fallback"): Promise<void> {
     if (!candidate) return;
     const generation = workGenerationRef.current;
-    const effectiveDecision = mode === "captions_only" ? "fallback" : decision;
+    const effectiveDecision = mode === "asl_captions" ? decision : "fallback";
     setDeciding(true);
     setError("");
     if (runtime === "demo") {
@@ -583,9 +785,64 @@ export function App(): ReactNode {
     }
   }
 
+  async function decideAvatar(confirm: boolean): Promise<void> {
+    const pending = pendingAvatarMessage;
+    if (!pending) return;
+    if (!confirm) {
+      setPendingAvatarMessage(null);
+      setAvatarRequest(null);
+      setFallbackReason("staff_rejected");
+      setProcessState("fallback");
+      setNotice("Staff kept the English caption only. Nothing was sent to Hand Talk.");
+      return;
+    }
+
+    const generation = workGenerationRef.current;
+    setDeciding(true);
+    setError("");
+    try {
+      const authorization = await authorizeAvatar(pending.text, pending.source);
+      if (generation !== workGenerationRef.current) return;
+      if (!authorization.allowed) {
+        setPendingAvatarMessage(null);
+        setAvatarRequest(null);
+        setFallbackReason(authorization.reasonCode);
+        setProcessState("fallback");
+        setNotice("Safety checks kept this message as captions only. Nothing was sent to Hand Talk.");
+        return;
+      }
+      setPendingAvatarMessage(null);
+      setFallbackReason("");
+      avatarExecutionRef.current = {
+        authorizationId: authorization.authorizationId,
+        authorizedAt: performance.now(),
+        started: false,
+        terminal: false,
+      };
+      setAvatarRequest({ id: authorization.authorizationId, text: authorization.text });
+      setProcessState("playing");
+      setNotice("Staff confirmed this message. The finalized caption remains visible while the experimental avatar signs.");
+    } catch (authorizationError) {
+      if (generation !== workGenerationRef.current) return;
+      setPendingAvatarMessage(null);
+      setAvatarRequest(null);
+      avatarExecutionRef.current = null;
+      setError(formatError(authorizationError));
+      setFallbackReason(authorizationError instanceof ApiError ? authorizationError.code ?? "avatar_error" : "avatar_error");
+      setProcessState("fallback");
+    } finally {
+      if (generation === workGenerationRef.current) setDeciding(false);
+    }
+  }
+
   async function signOut(): Promise<void> {
     resetUtterance();
     if (runtime === "live") await endSession().catch(() => undefined);
+    setMode("captions_only");
+    setAvatarActivationAcknowledged(false);
+    setAvatarActivated(false);
+    setAvatarConfig(DISABLED_AVATAR_CONFIG);
+    setAvatarState("unavailable");
     setSession(null);
     setView("reception");
   }
@@ -617,8 +874,13 @@ export function App(): ReactNode {
     return <AccessGate onSession={(nextSession, nextRuntime) => {
       setSession(nextSession);
       setRuntime(nextRuntime);
+      setMode("captions_only");
       setConnection("idle");
       setCatalog(nextRuntime === "demo" ? DEMO_CATALOG : { ...DEMO_CATALOG, intents: [] });
+      setAvatarActivationAcknowledged(false);
+      setAvatarActivated(false);
+      setAvatarConfig(DISABLED_AVATAR_CONFIG);
+      setAvatarState("unavailable");
     }} />;
   }
 
@@ -638,7 +900,7 @@ export function App(): ReactNode {
         <div className="demo-ribbon" role="status">
           <Icon name="flask" />
           <strong>Local product demo</strong>
-          <span>Scripted transcript and browser-only rules. No Cloud Speech, Gemini, Firestore, or reviewed ASL assets.</span>
+          <span>Scripted transcript and browser-only rules. No Cloud Speech, Gemini, Hand Talk, Firestore, or reviewed ASL assets.</span>
         </div>
       ) : null}
 
@@ -653,31 +915,19 @@ export function App(): ReactNode {
                 <span className="privacy-chip"><Icon name="shield" /> Audio is not retained</span>
               </div>
               <h1>Help every visitor feel understood.</h1>
-              <p className="lede">Speak, type, or choose a bounded reception phrase. English captions always stay visible.</p>
+              <p className="lede">English captions are the default. Staff may separately choose a reviewed phrase or confirm one experimental avatar message.</p>
 
               <div className="scope-note">
                 <Icon name="info" />
                 <div>
-                  <strong>Reception conversations only</strong>
-                  <p>Not for emergencies, health, legal, security, payment, identity, or employment matters. Use qualified communication support when needed.</p>
+                  <strong>Signing is always opt-in</strong>
+                  <p>Reviewed clips and the experimental avatar are separate modes. Avatar text is sent only after per-message staff confirmation. Never use automatic ASL for emergencies, health, legal, security, payment, identity, or employment matters.</p>
                 </div>
               </div>
 
               <fieldset className="mode-fieldset">
                 <legend>Visitor display</legend>
                 <div className="segmented-control">
-                  <label className={mode === "asl_captions" ? "selected" : ""}>
-                    <input
-                      type="radio"
-                      name="experience-mode"
-                      value="asl_captions"
-                      checked={mode === "asl_captions"}
-                      disabled={interactionLocked}
-                      onChange={() => selectExperienceMode("asl_captions")}
-                    />
-                    <Icon name="hands" />
-                    <span><strong>ASL + captions</strong><small>Reviewed phrases only</small></span>
-                  </label>
                   <label className={mode === "captions_only" ? "selected" : ""}>
                     <input
                       type="radio"
@@ -688,10 +938,69 @@ export function App(): ReactNode {
                       onChange={() => selectExperienceMode("captions_only")}
                     />
                     <Icon name="captions" />
-                    <span><strong>Captions only</strong><small>No video requested</small></span>
+                    <span><strong>Captions only</strong><small>Default · no signing request</small></span>
+                  </label>
+                  <label className={mode === "asl_captions" ? "selected" : ""}>
+                    <input
+                      type="radio"
+                      name="experience-mode"
+                      value="asl_captions"
+                      checked={mode === "asl_captions"}
+                      disabled={interactionLocked}
+                      onChange={() => selectExperienceMode("asl_captions")}
+                    />
+                    <Icon name="hands" />
+                    <span><strong>Reviewed ASL + captions</strong><small>Published phrases · staff approval</small></span>
+                  </label>
+                  <label className={mode === "avatar_captions" ? "selected" : ""}>
+                    <input
+                      type="radio"
+                      name="experience-mode"
+                      value="avatar_captions"
+                      checked={mode === "avatar_captions"}
+                      disabled={interactionLocked}
+                      onChange={() => selectExperienceMode("avatar_captions")}
+                    />
+                    <Icon name="spark" />
+                    <span><strong>Experimental avatar + captions</strong><small>{!avatarActivated ? "Activation required" : avatarConfig === null ? "Checking provider" : avatarConfig.enabled ? "Confirm every message" : "Provider not configured"}</small></span>
                   </label>
                 </div>
               </fieldset>
+
+              {mode === "avatar_captions" ? (
+                <section className="avatar-activation" aria-labelledby="avatar-activation-title">
+                  <div>
+                    <p className="step-label">Experimental provider activation</p>
+                    <h2 id="avatar-activation-title">Confirm the visitor chose avatar signing</h2>
+                  </div>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={avatarActivationAcknowledged}
+                      disabled={avatarActivated || interactionLocked}
+                      onChange={(event) => setAvatarActivationAcknowledged(event.target.checked)}
+                    />
+                    <span>The visitor chose the experimental avatar. I understand finalized text goes to Hand Talk only after I confirm each message, and its output may be wrong and is not interpretation.</span>
+                  </label>
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    disabled={!avatarActivationAcknowledged || avatarActivated || interactionLocked}
+                    onClick={activateAvatarMode}
+                  >
+                    <Icon name="shield" /> {avatarActivated ? "Experimental avatar enabled" : "Enable experimental avatar"}
+                  </button>
+                  {avatarActivated ? (
+                    <p className="microcopy" role="status">
+                      {avatarConfig === null
+                        ? "Checking provider configuration… No message text has been sent."
+                        : avatarConfig.enabled
+                          ? "Provider ready. Each message still requires separate confirmation."
+                          : "Provider unavailable. Continue with captions or reviewed ASL phrases."}
+                    </p>
+                  ) : null}
+                </section>
+              ) : null}
 
               <section className="input-card" aria-labelledby="input-heading">
                 <div className="card-heading">
@@ -699,7 +1008,7 @@ export function App(): ReactNode {
                     <p className="step-label">Step 1</p>
                     <h2 id="input-heading">Create the message</h2>
                   </div>
-                  {processState === "candidate" || processState === "fallback" || processState === "playing" ? <button className="text-button" type="button" onClick={resetUtterance}>Clear</button> : null}
+                  {processState === "candidate" || processState === "avatar_confirmation" || processState === "fallback" || processState === "playing" ? <button className="text-button" type="button" onClick={resetUtterance}>Clear</button> : null}
                 </div>
 
                 <div className="input-tabs" aria-label="Message input method">
@@ -734,7 +1043,12 @@ export function App(): ReactNode {
                   ) : null}
                   {inputMethod === "upload" ? <UploadPanel uploading={uploading} onChange={(event) => void handleUpload(event)} /> : null}
                   {inputMethod === "type" ? (
-                    <TypePanel value={typedMessage} onChange={setTypedMessage} onSubmit={submitTyped} />
+                    <TypePanel
+                      value={typedMessage}
+                      submitLabel={mode === "avatar_captions" ? "Prepare avatar & caption" : "Show caption"}
+                      onChange={setTypedMessage}
+                      onSubmit={submitTyped}
+                    />
                   ) : null}
                   {inputMethod === "phrases" ? (
                     <PhrasePanel catalog={catalog} value={selectedPhrase} message={catalogMessage} onChange={setSelectedPhrase} onSubmit={showManualPhrase} />
@@ -754,8 +1068,26 @@ export function App(): ReactNode {
                 <StateBadge state={processState} />
               </div>
 
-              <div className={`visitor-stage ${asset ? "has-video" : ""}`}>
-                {asset ? (
+              <div className={`visitor-stage ${asset ? "has-video" : ""} ${avatarConfig?.enabled && mode === "avatar_captions" && avatarRequest ? "has-avatar" : ""}`}>
+                {avatarConfig?.enabled && mode === "avatar_captions" && avatarRequest ? (
+                  <AvatarStage
+                    ref={avatarRef}
+                    config={avatarConfig}
+                    request={avatarRequest}
+                    caption={finalCaption}
+                    state={avatarState}
+                    onStateChange={(next) => {
+                      handleAvatarStateChange(next);
+                      if (next === "translating") setProcessState("playing");
+                    }}
+                    onError={(message) => {
+                      setAvatarRequest(null);
+                      setError(message);
+                      setFallbackReason("avatar_error");
+                      setProcessState("fallback");
+                    }}
+                  />
+                ) : asset ? (
                   <VideoStage
                     ref={videoRef}
                     asset={asset}
@@ -787,6 +1119,15 @@ export function App(): ReactNode {
                 <ConfirmationCard focusRef={confirmationRef} candidate={candidate} deciding={deciding} onDecision={(next) => void decide(next)} />
               ) : null}
 
+              {pendingAvatarMessage && processState === "avatar_confirmation" ? (
+                <AvatarConfirmationCard
+                  focusRef={confirmationRef}
+                  message={pendingAvatarMessage}
+                  deciding={deciding}
+                  onDecision={(confirm) => void decideAvatar(confirm)}
+                />
+              ) : null}
+
               {processState === "fallback" ? (
                 <FallbackCard reason={fallbackReason} error={error} onType={() => setInputMethod("type")} onSupport={() => setNotice("Ask the visitor which communication support they prefer. For urgent danger, follow your emergency procedure.")} />
               ) : null}
@@ -794,18 +1135,19 @@ export function App(): ReactNode {
               {notice ? <div className="notice" role="status"><Icon name="info" /><span>{notice}</span></div> : null}
               {error && processState !== "fallback" ? <div className="error-message" role="alert">{error}</div> : null}
 
-              {asset ? (
+              {asset || avatarRequest ? (
                 <FeedbackPanel
                   open={showFeedback}
                   sent={feedbackSent}
                   onToggle={() => setShowFeedback((current) => !current)}
                   onSend={async (category, severity) => {
-                    if (!candidate && !asset) return;
+                    if (!candidate && !asset && !avatarRequest) return;
                     try {
                       await sendFeedback({
                         sessionId: session.sessionId,
-                        utteranceId: asset.utteranceId,
-                        assetId: asset.assetId,
+                        ...(asset
+                          ? { utteranceId: asset.utteranceId, assetId: asset.assetId }
+                          : avatarRequest ? { utteranceId: avatarRequest.id } : {}),
                         reporterRole: "staff",
                         issueCategory: category,
                         severity,
@@ -825,8 +1167,8 @@ export function App(): ReactNode {
 
       <footer className="app-footer">
         <span>SignBridge Reception</span>
-        <span>Bounded pilot · English + U.S. ASL</span>
-        <span>Does not replace a qualified interpreter</span>
+        <span>Captions default · reviewed phrases and avatar are opt-in</span>
+        <span>Experimental output is unverified and does not replace a qualified interpreter</span>
       </footer>
     </div>
   );
@@ -859,14 +1201,14 @@ function AccessGate({ onSession }: { onSession: (session: SessionInfo, runtime: 
         <div className="story-copy">
           <p className="eyebrow">A more welcoming front desk</p>
           <h1 id="welcome-title">Make the first conversation accessible.</h1>
-          <p>SignBridge helps staff share ten everyday reception messages through clear captions and, when approved, human-recorded ASL video.</p>
+          <p>SignBridge keeps finalized English visible, with separate opt-in lanes for reviewed ASL phrases and an experimental 3D avatar.</p>
         </div>
         <div className="scope-grid">
-          <div><Icon name="captions" /><strong>Captions always</strong><span>Every final message stays visible.</span></div>
-          <div><Icon name="hands" /><strong>People, not avatars</strong><span>Only whole, reviewed signing clips.</span></div>
-          <div><Icon name="shield" /><strong>Privacy by design</strong><span>Audio is processed, then discarded.</span></div>
+          <div><Icon name="captions" /><strong>Captions by default</strong><span>Every final message stays visible.</span></div>
+          <div><Icon name="hands" /><strong>Reviewed phrase lane</strong><span>Published clips still require staff approval.</span></div>
+          <div><Icon name="shield" /><strong>Avatar confirmation</strong><span>Nothing is sent to the provider until staff confirms that message.</span></div>
         </div>
-        <p className="access-disclaimer">A bounded communication aid for routine reception—not emergency, medical, legal, security, payment, identity, or employment communication.</p>
+        <p className="access-disclaimer">Automatic avatar output is experimental, may be wrong, and is not certified interpretation. Use qualified support for consequential communication.</p>
       </section>
 
       <section className="access-panel" aria-labelledby="access-title">
@@ -891,7 +1233,7 @@ function AccessGate({ onSession }: { onSession: (session: SessionInfo, runtime: 
             </div>
             <label className="consent-check">
               <input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} />
-              <span>I will tell the visitor before starting the microphone. I understand that provisional words are not used to select ASL.</span>
+              <span>I will tell the visitor before starting the microphone. I understand captions are the default and every experimental avatar message requires separate staff confirmation.</span>
             </label>
             <button className="primary-button wide" type="submit" disabled={!consent || !code.trim() || busy}>
               {busy ? <><span className="spinner" aria-hidden="true" /> Checking code…</> : <>Open reception <Icon name="arrow" /></>}
@@ -907,7 +1249,7 @@ function AccessGate({ onSession }: { onSession: (session: SessionInfo, runtime: 
             >
               <Icon name="flask" /> Explore local demo
             </button>
-            <small>Clearly labeled simulation. No cloud services or reviewed ASL media.</small>
+            <small>Clearly labeled caption simulation. No cloud service or avatar provider is called.</small>
           </div>
         </div>
       </section>
@@ -995,8 +1337,8 @@ function UploadPanel({ uploading, onChange }: { uploading: boolean; onChange: (e
   );
 }
 
-function TypePanel(props: { value: string; onChange: (value: string) => void; onSubmit: (event: FormEvent) => void }): ReactNode {
-  const maxLength = 280;
+function TypePanel(props: { value: string; submitLabel: string; onChange: (value: string) => void; onSubmit: (event: FormEvent) => void }): ReactNode {
+  const maxLength = 1_000;
   return (
     <form className="type-panel" onSubmit={props.onSubmit}>
       <label htmlFor="typed-message">Message for the visitor</label>
@@ -1006,9 +1348,9 @@ function TypePanel(props: { value: string; onChange: (value: string) => void; on
         onChange={(event) => props.onChange(event.target.value)}
         maxLength={maxLength}
         rows={4}
-        placeholder="Type a clear, short reception message…"
+        placeholder="Type clear English for the caption and experimental avatar…"
       />
-      <div className="form-row"><span>{props.value.length}/{maxLength}</span><button className="primary-button" disabled={!props.value.trim()} type="submit"><Icon name="captions" /> Show caption</button></div>
+      <div className="form-row"><span>{props.value.length}/{maxLength}</span><button className="primary-button" disabled={!props.value.trim()} type="submit"><Icon name={props.submitLabel.startsWith("Prepare") ? "hands" : "captions"} /> {props.submitLabel}</button></div>
     </form>
   );
 }
@@ -1078,6 +1420,34 @@ function ConfirmationCard({ focusRef, candidate, deciding, onDecision }: { focus
   );
 }
 
+function AvatarConfirmationCard({
+  focusRef,
+  message,
+  deciding,
+  onDecision,
+}: {
+  focusRef: RefObject<HTMLElement | null>;
+  message: PendingAvatarMessage;
+  deciding: boolean;
+  onDecision: (confirm: boolean) => void;
+}): ReactNode {
+  return (
+    <section ref={focusRef} tabIndex={-1} className="confirmation-card avatar-confirmation-card" aria-labelledby="avatar-confirm-title">
+      <div className="confirmation-icon"><Icon name="shield" /></div>
+      <div className="confirmation-copy">
+        <p className="step-label">Step 2 · Per-message confirmation required</p>
+        <h3 id="avatar-confirm-title">Send this caption to the experimental avatar?</h3>
+        <div className="intent-choice"><strong>Final English caption</strong><span>{message.text}</span></div>
+        <p className="safety-copy">Nothing has been sent to Hand Talk. Confirm only for routine, non-consequential communication; automatic ASL may be wrong or incomplete.</p>
+        <div className="button-row">
+          <button className="primary-button" type="button" disabled={deciding} onClick={() => onDecision(true)}><Icon name="play" /> Confirm avatar message</button>
+          <button className="secondary-button" type="button" disabled={deciding} onClick={() => onDecision(false)}>Keep captions only</button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function FallbackCard(props: { reason: string; error: string; onType: () => void; onSupport: () => void }): ReactNode {
   const copy = props.error || FALLBACK_COPY[props.reason] || "A signing phrase was not selected. Keep the English caption visible or use another communication option.";
   return (
@@ -1095,6 +1465,67 @@ function FallbackCard(props: { reason: string; error: string; onType: () => void
     </section>
   );
 }
+
+const AvatarStage = forwardRef<HandTalkAvatarHandle, {
+  config: AvatarRuntimeConfig;
+  request: AvatarTranslationRequest | null;
+  caption: string;
+  state: AvatarPlaybackState;
+  onStateChange: (state: AvatarPlaybackState) => void;
+  onError: (message: string) => void;
+}>(function AvatarStage(props, ref): ReactNode {
+  const handle = (): HandTalkAvatarHandle | null =>
+    ref && typeof ref === "object" ? ref.current : null;
+
+  return (
+    <div className="avatar-stage">
+      <div className="video-label avatar-label">
+        <span><Icon name="spark" /> Experimental synthetic ASL avatar</span>
+        <small>Hand Talk · automatic output · not Deaf-reviewed</small>
+      </div>
+      <HandTalkAvatar
+        ref={ref}
+        config={props.config}
+        request={props.request}
+        caption={props.caption}
+        onStateChange={props.onStateChange}
+        onError={props.onError}
+      />
+      {!props.request ? (
+        <div className="avatar-ready-copy">
+          <strong>Avatar ready</strong>
+          <span>Speak, upload, or type a short English message.</span>
+        </div>
+      ) : null}
+      <div className="video-caption">
+        <span>English caption · final</span>
+        <p>{props.caption || "Final English words will remain visible here."}</p>
+      </div>
+      <div className="video-actions avatar-actions">
+        {props.state === "paused" ? (
+          <button type="button" onClick={() => handle()?.resume()}><Icon name="play" /> Resume</button>
+        ) : (
+          <button type="button" disabled={props.state !== "translating"} onClick={() => handle()?.pause()}><Icon name="pause" /> Pause</button>
+        )}
+        <button
+          type="button"
+          disabled={!props.request || props.state === "loading"}
+          onClick={() => void handle()?.repeat().catch((error: unknown) => props.onError(
+            error instanceof Error ? error.message : "The avatar could not replay this message.",
+          ))}
+        ><Icon name="replay" /> Replay</button>
+        <label>
+          <span className="sr-only">Avatar speed</span>
+          <select defaultValue="normal" onChange={(event) => handle()?.changeSpeed(event.target.value as "normal" | "slow" | "fast")}>
+            <option value="slow">0.5×</option>
+            <option value="normal">1×</option>
+            <option value="fast">1.5×</option>
+          </select>
+        </label>
+      </div>
+    </div>
+  );
+});
 
 const VideoStage = forwardRef<HTMLVideoElement, { asset: PlaybackAsset; caption: string; onStarted: () => void; onEnded: () => void; onFailed: () => void }>(function VideoStage(props, ref): ReactNode {
   return (
@@ -1183,7 +1614,7 @@ function MetricCard({ label, value, detail, icon }: { label: string; value: stri
 }
 
 function StateBadge({ state }: { state: ProcessState }): ReactNode {
-  const labels: Record<ProcessState, string> = { idle: "Ready", preparing: "Preparing", listening: "Listening", finalizing: "Finalizing", classifying: "Checking phrase", candidate: "Staff review", fallback: "Caption ready", playing: "ASL + caption" };
+  const labels: Record<ProcessState, string> = { idle: "Ready", preparing: "Preparing", listening: "Listening", finalizing: "Finalizing", classifying: "Checking phrase", candidate: "Staff review", avatar_confirmation: "Avatar confirmation", fallback: "Caption ready", playing: "ASL + caption" };
   return <span className={`state-badge ${state}`}><span />{labels[state]}</span>;
 }
 

@@ -14,9 +14,39 @@ export const INTENT_IDS = [
 ] as const satisfies readonly ReceptionIntentId[];
 
 export type IntentId = ReceptionIntentId;
-export type ExperienceMode = "asl_captions" | "captions_only";
+export type ExperienceMode = "captions_only" | "asl_captions" | "avatar_captions";
 export type InputMethod = "speak" | "upload" | "type" | "phrases";
 export type RuntimeMode = "live" | "demo";
+export type AvatarMessageSource = "speech" | "upload" | "type" | "phrase";
+
+export interface AvatarRuntimeConfig {
+  provider: "handtalk";
+  enabled: boolean;
+  status: "experimental";
+  avatar: "HUGO" | "MAYA";
+  language: "enUS";
+  signLanguage: "en-ase";
+  maxCharacters: number;
+  sdkUrl?: string;
+  token?: string;
+}
+
+export type AvatarPlaybackState =
+  | "unavailable"
+  | "loading"
+  | "ready"
+  | "translating"
+  | "paused"
+  | "error";
+
+export interface AvatarTranslationRequest {
+  id: string;
+  text: string;
+}
+
+export interface PendingAvatarMessage extends AvatarTranslationRequest {
+  source: AvatarMessageSource;
+}
 
 export interface CatalogIntent {
   id: IntentId;
