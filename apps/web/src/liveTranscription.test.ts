@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { CURRENT_CONSENT_VERSION } from "./api.js";
 import { LiveTranscriptionSocket } from "./liveTranscription.js";
 
 class WebSocketStub {
@@ -42,6 +43,8 @@ describe("LiveTranscriptionSocket", () => {
     const socket = new LiveTranscriptionSocket({
       sessionId: "session-test-1",
       siteId: "site-test-1",
+      consentVersion: CURRENT_CONSENT_VERSION,
+      outputLane: "captions_only",
       onEvent: vi.fn(),
       onConnection,
     });
@@ -55,18 +58,21 @@ describe("LiveTranscriptionSocket", () => {
     expect(onConnection).toHaveBeenLastCalledWith("idle");
   });
 
-  it("sends the server-owned audio configuration only after open", async () => {
+  it("sends the retained HTTP-session consent and server-owned audio configuration only after open", async () => {
     vi.stubGlobal("window", {
       location: { protocol: "https:", host: "pilot.example" },
       setTimeout,
       clearTimeout,
     });
     vi.stubGlobal("WebSocket", WebSocketStub);
+    const onConnection = vi.fn();
     const socket = new LiveTranscriptionSocket({
       sessionId: "session-test-2",
       siteId: "site-test-2",
+      consentVersion: CURRENT_CONSENT_VERSION,
+      outputLane: "avatar_captions",
       onEvent: vi.fn(),
-      onConnection: vi.fn(),
+      onConnection,
     });
 
     const connecting = socket.connect();
@@ -76,7 +82,6 @@ describe("LiveTranscriptionSocket", () => {
     if (!transport) throw new Error("expected a WebSocket transport");
     transport.readyState = WebSocketStub.OPEN;
     transport.onopen?.({} as Event);
-    await connecting;
 
     const configuration = JSON.parse(String(transport.send.mock.calls[0]?.[0])) as Record<string, unknown>;
     expect(configuration).toMatchObject({
@@ -84,9 +89,32 @@ describe("LiveTranscriptionSocket", () => {
       sessionId: "session-test-2",
       siteId: "site-test-2",
       locale: "en-US",
+      consentVersion: CURRENT_CONSENT_VERSION,
+      outputLane: "avatar_captions",
       retention: "none",
       audio: { encoding: "LINEAR16", sampleRateHertz: 16000, channelCount: 1 },
     });
+    expect(onConnection).toHaveBeenLastCalledWith("connecting");
+    expect(socket.sendAudio(new ArrayBuffer(8))).toBe(false);
+
+    transport.onmessage?.({
+      data: JSON.stringify({
+        type: "session.ready",
+        session: {
+          id: "audio-session-test-2",
+          siteId: "site-test-2",
+          mode: "live",
+          locale: "en-US",
+          consentVersion: CURRENT_CONSENT_VERSION,
+          audio: { encoding: "LINEAR16", sampleRateHertz: 16000, channelCount: 1 },
+          lifecycle: "listening",
+          retention: "none",
+          createdAt: "2026-08-02T20:00:00.000Z",
+        },
+      }),
+    } as MessageEvent);
+    await connecting;
+    expect(onConnection).toHaveBeenLastCalledWith("connected");
     socket.close();
   });
 });

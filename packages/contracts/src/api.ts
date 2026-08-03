@@ -11,6 +11,7 @@ import {
   AudioConfigurationSchema,
   AudioSessionSchema,
   DetectedIntentSchema,
+  ExperienceModeSchema,
   FeedbackIssueCategorySchema,
   RenderSegmentSchema,
   SignPlanSchema,
@@ -47,6 +48,7 @@ export const LiveSessionConfigSchema = z
     siteId: IdentifierSchema,
     locale: LocaleSchema,
     consentVersion: VersionSchema,
+    outputLane: ExperienceModeSchema,
     audio: AudioConfigurationSchema,
     retention: z.literal("none"),
   })
@@ -68,6 +70,11 @@ export const LiveClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("session.cancel"), sessionId: IdentifierSchema }).strict(),
 ]);
 export type LiveClientMessage = z.infer<typeof LiveClientMessageSchema>;
+
+export const AudioTranscriptionQuerySchema = z
+  .object({ outputLane: ExperienceModeSchema })
+  .strict();
+export type AudioTranscriptionQuery = z.infer<typeof AudioTranscriptionQuerySchema>;
 
 /** Binary WebSocket frames are the only valid audio-chunk payload. */
 export const LIVE_AUDIO_BINARY_FRAME_MAX_BYTES = 64 * 1024;
@@ -139,6 +146,7 @@ export type LiveServerEvent = z.infer<typeof LiveServerEventSchema>;
 
 export const AudioTranscriptionResponseSchema = z
   .object({
+    outputLane: ExperienceModeSchema,
     session: AudioSessionSchema,
     segments: z.array(TranscriptSegmentSchema).max(100),
     stableUtterances: z.array(StableUtteranceSchema).max(100),

@@ -102,13 +102,10 @@ export class TranscriptionService {
     });
   }
 
-  async classifyFinalSegments(
-    auth: AuthSession,
+  stabilizeFinalSegments(
     session: AudioSession,
     segments: readonly TranscriptSegment[],
-    flow: "live" | "upload",
-  ): Promise<ClassificationBundle> {
-    const detectionStartedAt = Date.now();
+  ): StableUtterance {
     const preflightText = [...segments]
       .sort((left, right) => left.sequence - right.sequence)
       .map((segment) => segment.text)
@@ -117,20 +114,30 @@ export class TranscriptionService {
     if (preflightText.length > 2_000) {
       throw new TranscriptionFallbackError("transcript_too_long");
     }
+    return createStableUtterance({
+      id: randomUUID(),
+      sessionId: session.id,
+      segments,
+      finalizedAt: new Date().toISOString(),
+    });
+  }
+
+  async classifyFinalSegments(
+    auth: AuthSession,
+    session: AudioSession,
+    segments: readonly TranscriptSegment[],
+    flow: "live" | "upload",
+  ): Promise<ClassificationBundle> {
+    const detectionStartedAt = Date.now();
+    const utterance = this.stabilizeFinalSegments(session, segments);
     const preflight = runSafetyGate({
-      text: preflightText,
+      text: utterance.transcript,
       locale: "en-US",
       isFinal: segments.every((segment) => segment.state === "final"),
     });
     if (!preflight.allowed && preflight.reasonCode === "transcript_too_long") {
       throw new TranscriptionFallbackError("transcript_too_long");
     }
-    const utterance = createStableUtterance({
-      id: randomUUID(),
-      sessionId: session.id,
-      segments,
-      finalizedAt: new Date().toISOString(),
-    });
     const detectedIntent = await this.#detect(utterance);
     if (detectedIntent.status === "supported") {
       const pending: PendingDecision = {

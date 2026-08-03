@@ -8,12 +8,13 @@ These files configure a Cloud Run deployment; they do not claim that a Google Cl
 Before the first build, an operator must:
 
 1. Create a project and billing budget/alerts, then enable Cloud Run, Cloud Build, Artifact Registry, Speech-to-Text, Vertex AI, Firestore, Cloud Storage, Secret Manager, and Cloud Scheduler.
-2. Create `signbridge-runtime` and `signbridge-scheduler` service accounts. Grant the runtime only Speech client, Vertex AI user, Datastore user, Secret Manager accessor for the three named secrets, and object viewer/signed-URL permissions for the one private bucket.
-3. Create the three secrets referenced in `cloudbuild.yaml`, a private uniform-access bucket, a Firestore Native database, and an Artifact Registry repository.
+2. Create `signbridge-runtime` and `signbridge-scheduler` service accounts. Grant the runtime only Speech client, Vertex AI user, Datastore user, Secret Manager accessor for the four named secrets, and object viewer/signed-URL permissions for the one private bucket.
+3. Create the four secrets referenced in `cloudbuild.yaml` (`signbridge-session-secret`, `signbridge-site-code`, `signbridge-admin-code`, and `signbridge-handtalk-token`), a private uniform-access bucket, a Firestore Native database, and an Artifact Registry repository. The Hand Talk secret must contain a contracted fixed-channel browser SDK token; never store the token in Git.
 4. Replace all `change-me` substitutions. `APP_ORIGIN` must be the exact staging custom-domain origin and is also the scheduled-job OIDC audience; never use `*`.
 5. Publish a rights-cleared, exact-hash-reviewed catalog and change `SIGN_CATALOG_PATH` only after its validation succeeds. The tracked draft disables all playback.
 6. Run `configure-firestore-ttl.ps1` and verify that the `usageEvents.expiresAt` TTL policy is enabled. `EVENT_RETENTION_DAYS` controls the timestamp written by the API; it does not enable Firestore TTL by itself.
-7. For any environment that enables the daily job, run `configure-scheduler.ps1` with the same origin used for that service's `APP_ORIGIN`. The service already receives that exact value as `INTERNAL_OIDC_AUDIENCE`. After production promotion, update the job to the production origin.
+7. The staging Cloud Build keeps zero warm instances so cold-start behavior can be measured. Production promotion keeps one warm instance for the staffed pilot; record its actual idle cost and remove it when the pilot closes.
+8. For any environment that enables the daily job, run `configure-scheduler.ps1` with the same origin used for that service's `APP_ORIGIN`. The service already receives that exact value as `INTERNAL_OIDC_AUDIENCE`. After production promotion, update the job to the production origin.
 
 `cloudbuild.yaml` targets `signbridge-reception-staging` by default and the container build runs the full repository verification gate. Rehearse that exact commit and catalog in staging. Resolve its immutable Artifact Registry digest, then run `promote-production.ps1` with that digest and the verified commit SHA; the script deploys the same bytes to the production service and prints the resulting URL, revision, and image. Do not promote by a mutable tag.
 

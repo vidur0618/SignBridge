@@ -34,9 +34,16 @@ flowchart LR
   api --> events["Transcript-free aggregate events"]
 ```
 
+The browser AudioWorklet downmixes input to mono, performs continuous area-weighted
+resampling from the hardware rate (including 44.1 and 48 kHz) to 16 kHz, and sends
+40 ms LINEAR16 frames (640 samples / 1,280 bytes). The worklet accepts an explicit
+`flush` control message that emits the final short frame; full frames are never padded.
+On push-to-talk release, the browser waits for the worklet's flush acknowledgement
+before sending `audio.stop`, so the last partial frame reaches the speech socket first.
+
 ## Final-only speech rule
 
-Google Speech-to-Text V2 interim results may change. A partial result may update only the provisional caption. The reviewed lane may classify only a final result, and the avatar lane may queue only text delivered in an `isFinal` event. Releasing push-to-talk waits up to 1.2 seconds for a final result; without one, the provisional text is discarded and no avatar request is made.
+Google Speech-to-Text V2 interim results may change. A partial result may update only the provisional caption. The reviewed lane may classify only a final result; the captions-only and avatar lanes explicitly skip that classifier, while the avatar lane may queue only text delivered in an `isFinal` event. Releasing push-to-talk waits up to 1.2 seconds for a final result; without one, the provisional text is discarded and no avatar request is made.
 
 Uploaded audio is transcribed server-side and only the finalized returned transcript is eligible for either lane. Typed input is already explicit text and does not pass through Speech-to-Text.
 

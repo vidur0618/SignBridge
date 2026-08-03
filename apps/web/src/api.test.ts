@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { loadAvatarConfig, normalizeLiveEvent } from "./api.js";
+import { loadAvatarConfig, normalizeLiveEvent, transcribeAudio } from "./api.js";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -104,5 +104,63 @@ describe("live event normalization", () => {
       utteranceId: "utterance-1",
       reasonCode: "high_stakes_content",
     })).toEqual({ type: "fallback", utteranceId: "utterance-1", code: "high_stakes_content" });
+  });
+});
+
+describe("uploaded-audio output lane", () => {
+  it("requests the selected lane and accepts a stable caption without inventing a candidate", async () => {
+    const now = "2026-08-02T20:00:00.000Z";
+    const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>): Promise<Response> => new Response(
+      JSON.stringify({
+        outputLane: "avatar_captions",
+        session: {
+          id: "audio-session-1",
+          siteId: "site-1",
+          mode: "upload",
+          locale: "en-US",
+          consentVersion: "v1",
+          audio: { encoding: "WAV", sampleRateHertz: 16_000, channelCount: 1 },
+          lifecycle: "complete",
+          retention: "none",
+          createdAt: now,
+          endedAt: now,
+        },
+        segments: [{
+          id: "segment-1",
+          sessionId: "audio-session-1",
+          sequence: 0,
+          state: "final",
+          text: "Welcome",
+          startMs: 0,
+          endMs: 500,
+          provider: "google-cloud-speech-v2",
+          model: "chirp_3",
+          receivedAt: now,
+        }],
+        stableUtterances: [{
+          id: "utterance-1",
+          sessionId: "audio-session-1",
+          segmentIds: ["segment-1"],
+          transcript: "Welcome",
+          isFinal: true,
+          finalizationReason: "asr_is_final",
+          finalizedAt: now,
+        }],
+        detectedIntents: [],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await transcribeAudio(
+      new File([new Uint8Array([1, 2, 3])], "sample.wav", { type: "audio/wav" }),
+      "avatar_captions",
+    );
+
+    expect(result).toEqual({ transcript: "Welcome" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/audio/transcribe?outputLane=avatar_captions",
+      expect.objectContaining({ method: "POST", credentials: "same-origin" }),
+    );
   });
 });

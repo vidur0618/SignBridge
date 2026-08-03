@@ -30,3 +30,40 @@ describe("Hand Talk environment configuration", () => {
     expect(() => loadConfig({ HANDTALK_SDK_URL: "http://example.test/sdk.js" })).toThrow();
   });
 });
+
+describe("Google Speech-to-Text environment configuration", () => {
+  it("defaults chirp_3 to the supported us multi-region", () => {
+    const config = loadConfig({});
+
+    expect(config.googleSpeechModel).toBe("chirp_3");
+    expect(config.googleSpeechLocation).toBe("us");
+  });
+
+  it("rejects the unsupported global location for chirp_3", () => {
+    expect(() =>
+      loadConfig({
+        GOOGLE_SPEECH_LOCATION: "global",
+        GOOGLE_SPEECH_MODEL: "chirp_3",
+      }),
+    ).toThrow(/chirp_3 requires a currently supported GA location/);
+  });
+
+  it("rejects preview or unknown chirp_3 locations in a production configuration", () => {
+    expect(() =>
+      loadConfig({
+        GOOGLE_SPEECH_LOCATION: "europe-west2",
+        GOOGLE_SPEECH_MODEL: "chirp_3",
+      }),
+    ).toThrow(/chirp_3 requires a currently supported GA location/);
+  });
+
+  it("allows the global endpoint for a model that supports it", () => {
+    const config = loadConfig({
+      GOOGLE_SPEECH_LOCATION: "global",
+      GOOGLE_SPEECH_MODEL: "long",
+    });
+
+    expect(config.googleSpeechLocation).toBe("global");
+    expect(config.googleSpeechModel).toBe("long");
+  });
+});

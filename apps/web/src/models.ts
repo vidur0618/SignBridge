@@ -1,4 +1,4 @@
-import type { ReceptionIntentId } from "@signbridge/contracts";
+import type { ExperienceMode, ReceptionIntentId } from "@signbridge/contracts";
 
 export const INTENT_IDS = [
   "greeting",
@@ -14,7 +14,7 @@ export const INTENT_IDS = [
 ] as const satisfies readonly ReceptionIntentId[];
 
 export type IntentId = ReceptionIntentId;
-export type ExperienceMode = "captions_only" | "asl_captions" | "avatar_captions";
+export type { ExperienceMode };
 export type InputMethod = "speak" | "upload" | "type" | "phrases";
 export type RuntimeMode = "live" | "demo";
 export type AvatarMessageSource = "speech" | "upload" | "type" | "phrase";

@@ -9,8 +9,10 @@ import {
   useRef,
   useState,
 } from "react";
+import { runAvatarSafetyGate } from "@signbridge/contracts";
 import {
   ApiError,
+  CURRENT_CONSENT_VERSION,
   authorizeAvatar,
   endSession,
   exchangeSession,
@@ -45,7 +47,7 @@ import type {
 } from "./models.js";
 
 type ConnectionState = "idle" | "connecting" | "connected" | "offline";
-type ProcessState = "idle" | "preparing" | "listening" | "finalizing" | "classifying" | "candidate" | "avatar_confirmation" | "fallback" | "playing";
+type ProcessState = "idle" | "preparing" | "listening" | "finalizing" | "classifying" | "caption_ready" | "candidate" | "avatar_confirmation" | "fallback" | "playing";
 
 const INPUT_TABS: Array<{ id: InputMethod; label: string; detail: string }> = [
   { id: "speak", label: "Speak", detail: "Push to talk" },
@@ -326,7 +328,7 @@ export function App(): ReactNode {
         setFinalCaption(finalTranscriptRef.current);
       }
       setProcessState((current) => current === "finalizing" || current === "classifying"
-        ? "classifying"
+        ? mode === "asl_captions" ? "classifying" : "finalizing"
         : current);
       return;
     }
@@ -336,9 +338,9 @@ export function App(): ReactNode {
       if (mode === "avatar_captions") {
         prepareAvatarMessage(finalTranscriptRef.current, "speech");
       } else if (mode === "captions_only") {
-        setFallbackReason("captions_only_selected");
-        setProcessState("fallback");
-        setNotice("The final caption is ready. No avatar request was made.");
+        setFallbackReason("");
+        setProcessState("caption_ready");
+        setNotice("The final caption is ready. No phrase classifier or signing provider was invoked.");
       }
       return;
     }
@@ -346,6 +348,12 @@ export function App(): ReactNode {
       terminateLiveAttempt();
       if (mode === "avatar_captions" && finalReceivedRef.current) {
         prepareAvatarMessage(finalTranscriptRef.current || event.text || "", "speech");
+        return;
+      }
+      if (mode === "captions_only") {
+        setFallbackReason("");
+        setProcessState("caption_ready");
+        setNotice("The final caption is ready. No signing request was made.");
         return;
       }
       applyCandidate(event.candidate, event.text);
@@ -473,40 +481,15 @@ export function App(): ReactNode {
     setProcessState("preparing");
     let socket: LiveTranscriptionSocket | null = null;
     let readyToSend = false;
-    let microphoneReady = false;
+    let connectionReady = false;
     try {
-      await microphoneRef.current.start((frame) => {
-        if (!readyToSend || generation !== workGenerationRef.current) return;
-        if (!socket?.sendAudio(frame) && !stopRequestedRef.current) {
-          terminateLiveAttempt("offline");
-          setError("Audio stopped because the speech connection was interrupted.");
-          setFallbackReason("connection_lost");
-          setProcessState("fallback");
-        }
-      }, () => {
-        microphoneOpenedAtRef.current = performance.now();
-        captureDeadlineTimerRef.current = window.setTimeout(() => {
-          if (generation !== workGenerationRef.current) return;
-          if (readyToSend) {
-            void finalizeLiveCapture(generation);
-            return;
-          }
-          terminateLiveAttempt("offline");
-          setError("The speech connection was not ready within the 15-second capture limit.");
-          setFallbackReason("connection_timeout");
-          setProcessState("fallback");
-        }, 15_000);
-      });
-      microphoneReady = true;
-      if (generation !== workGenerationRef.current) {
-        await microphoneRef.current.stop();
-        return;
-      }
       let connectionError: unknown = null;
       for (let attempt = 0; attempt < 2; attempt += 1) {
         socket = new LiveTranscriptionSocket({
           sessionId: session.sessionId,
           siteId: session.siteId,
+          consentVersion: session.consentVersion,
+          outputLane: mode,
           onEvent: (event) => {
             if (generation === workGenerationRef.current) handleLiveEventRef.current(event);
           },
@@ -528,12 +511,31 @@ export function App(): ReactNode {
         }
       }
       if (connectionError || !socket) throw connectionError ?? new Error("Could not connect to live transcription.");
+      connectionReady = true;
+      if (generation !== workGenerationRef.current) {
+        socket.close();
+        return;
+      }
+      readyToSend = true;
+      await microphoneRef.current.start((frame) => {
+        if (!readyToSend || generation !== workGenerationRef.current) return;
+        if (!socket?.sendAudio(frame) && !stopRequestedRef.current) {
+          terminateLiveAttempt("offline");
+          setError("Audio stopped because the speech connection was interrupted.");
+          setFallbackReason("connection_lost");
+          setProcessState("fallback");
+        }
+      }, () => {
+        microphoneOpenedAtRef.current = performance.now();
+        captureDeadlineTimerRef.current = window.setTimeout(() => {
+          if (generation === workGenerationRef.current) void finalizeLiveCapture(generation);
+        }, 15_000);
+      });
       if (generation !== workGenerationRef.current) {
         socket.close();
         await microphoneRef.current.stop();
         return;
       }
-      readyToSend = true;
       const openedAt = microphoneOpenedAtRef.current;
       setRecordingSeconds(openedAt === null ? 0 : Math.min(15, (performance.now() - openedAt) / 1_000));
       setProcessState("listening");
@@ -542,12 +544,12 @@ export function App(): ReactNode {
       if (socketRef.current === socket) socketRef.current = null;
       await microphoneRef.current.stop().catch(() => undefined);
       if (generation !== workGenerationRef.current || isAbortError(captureError)) return;
-      terminateLiveAttempt(microphoneReady ? "offline" : "idle");
+      terminateLiveAttempt(connectionReady ? "idle" : "offline");
       setProcessState("fallback");
-      setFallbackReason(microphoneReady ? "speech_connection_unavailable" : "microphone_unavailable");
+      setFallbackReason(connectionReady ? "microphone_unavailable" : "speech_connection_unavailable");
       setError(captureError instanceof Error
         ? captureError.message
-        : microphoneReady ? "Live transcription could not connect." : "Microphone access was not available.");
+        : connectionReady ? "Microphone access was not available." : "Live transcription could not connect.");
     }
   }
 
@@ -559,7 +561,7 @@ export function App(): ReactNode {
       captureDeadlineTimerRef.current = null;
     }
     setProcessState("finalizing");
-    await microphoneRef.current.stop();
+    await microphoneRef.current.stop({ flush: true });
     if (generation !== workGenerationRef.current) return;
     if (!socketRef.current?.endUtterance()) {
       terminateLiveAttempt("offline");
@@ -573,6 +575,12 @@ export function App(): ReactNode {
       terminateLiveAttempt();
       if (mode === "avatar_captions" && finalTranscriptRef.current) {
         prepareAvatarMessage(finalTranscriptRef.current, "speech");
+        return;
+      }
+      if (mode === "captions_only" && finalTranscriptRef.current) {
+        setFallbackReason("");
+        setProcessState("caption_ready");
+        setNotice("The finalized caption is ready. The speech-end acknowledgement timed out, but no phrase classification was requested.");
         return;
       }
       setFallbackReason("classification_timeout");
@@ -604,7 +612,12 @@ export function App(): ReactNode {
       demoPartialTimerRef.current = window.setTimeout(() => {
         if (generation !== workGenerationRef.current) return;
         if (mode === "avatar_captions") prepareAvatarMessage(DEMO_TRANSCRIPT, "speech");
-        else applyCandidate(classifyDemoTranscript(DEMO_TRANSCRIPT));
+        else if (mode === "asl_captions") applyCandidate(classifyDemoTranscript(DEMO_TRANSCRIPT));
+        else {
+          setFallbackReason("");
+          setProcessState("caption_ready");
+          setNotice("Local demo caption ready. No classifier or signing provider was invoked.");
+        }
       }, 500);
       return;
     }
@@ -639,19 +652,32 @@ export function App(): ReactNode {
         if (generation !== workGenerationRef.current) return;
         setFinalCaption("Please wait here.");
         if (mode === "avatar_captions") prepareAvatarMessage("Please wait here.", "upload");
-        else applyCandidate(classifyDemoTranscript("Please wait here."));
+        else if (mode === "asl_captions") applyCandidate(classifyDemoTranscript("Please wait here."));
+        else {
+          setFallbackReason("");
+          setProcessState("caption_ready");
+          setNotice("Local demo caption ready. No classifier or signing provider was invoked.");
+        }
         setUploading(false);
       }, 700);
       return;
     }
     try {
-      const result = await transcribeAudio(file);
+      const result = await transcribeAudio(file, mode);
       if (generation !== workGenerationRef.current) return;
       setFinalCaption(result.transcript);
       if (mode === "avatar_captions") {
         prepareAvatarMessage(result.transcript, "upload");
-      } else {
+      } else if (mode === "captions_only") {
+        setFallbackReason("");
+        setProcessState("caption_ready");
+        setNotice("The final caption is ready. No phrase classifier or signing provider was invoked.");
+      } else if (result.candidate) {
         applyCandidate(result.candidate, result.transcript);
+      } else {
+        setError("The reviewed-phrase lane did not return an intent decision. Keep the English caption visible.");
+        setFallbackReason("model_unavailable");
+        setProcessState("fallback");
       }
     } catch (uploadError) {
       if (generation !== workGenerationRef.current) return;
@@ -671,18 +697,26 @@ export function App(): ReactNode {
     setFinalCaption(text);
     if (mode === "avatar_captions") {
       prepareAvatarMessage(text, "type");
+    } else if (mode === "captions_only") {
+      const safety = runAvatarSafetyGate({ text, locale: "en-US", isFinal: true });
+      setCandidate(null);
+      if (!safety.allowed && safety.reasonCode === "high_stakes_content") {
+        setFallbackReason("high_stakes_content");
+        setProcessState("fallback");
+        setNotice("This may be consequential communication. Keep the English caption visible and use qualified support.");
+      } else {
+        setFallbackReason("");
+        setProcessState("caption_ready");
+        setNotice("The final caption is ready. No phrase classifier or signing provider was invoked.");
+      }
     } else if (runtime === "demo") {
       applyCandidate(classifyDemoTranscript(text), text);
-      setNotice(mode === "captions_only"
-        ? "Captions-only mode is active. Local demo classifier used deterministic browser rules only; Gemini was not called."
-        : "Local demo classifier: deterministic browser rules only; Gemini was not called.");
+      setNotice("Local demo classifier: deterministic browser rules only; Gemini was not called.");
     } else {
       setCandidate(null);
       setFallbackReason("typed_caption");
       setProcessState("fallback");
-      setNotice(mode === "captions_only"
-        ? "Captions-only mode is active. The English message was not sent for signing."
-        : "Typed messages remain captions in the reviewed-phrase lane. Choose a published phrase or use finalized speech.");
+      setNotice("Typed messages remain captions in the reviewed-phrase lane. Choose a published phrase or use finalized speech.");
     }
   }
 
@@ -995,7 +1029,11 @@ export function App(): ReactNode {
                       {avatarConfig === null
                         ? "Checking provider configuration… No message text has been sent."
                         : avatarConfig.enabled
-                          ? "Provider ready. Each message still requires separate confirmation."
+                          ? avatarState === "ready"
+                            ? "Provider ready. Each message still requires separate confirmation."
+                            : avatarState === "error"
+                              ? "Provider initialization failed. Continue with captions."
+                              : "Initializing the avatar provider… No message text has been sent."
                           : "Provider unavailable. Continue with captions or reviewed ASL phrases."}
                     </p>
                   ) : null}
@@ -1008,7 +1046,7 @@ export function App(): ReactNode {
                     <p className="step-label">Step 1</p>
                     <h2 id="input-heading">Create the message</h2>
                   </div>
-                  {processState === "candidate" || processState === "avatar_confirmation" || processState === "fallback" || processState === "playing" ? <button className="text-button" type="button" onClick={resetUtterance}>Clear</button> : null}
+                  {processState === "caption_ready" || processState === "candidate" || processState === "avatar_confirmation" || processState === "fallback" || processState === "playing" ? <button className="text-button" type="button" onClick={resetUtterance}>Clear</button> : null}
                 </div>
 
                 <div className="input-tabs" aria-label="Message input method">
@@ -1068,8 +1106,8 @@ export function App(): ReactNode {
                 <StateBadge state={processState} />
               </div>
 
-              <div className={`visitor-stage ${asset ? "has-video" : ""} ${avatarConfig?.enabled && mode === "avatar_captions" && avatarRequest ? "has-avatar" : ""}`}>
-                {avatarConfig?.enabled && mode === "avatar_captions" && avatarRequest ? (
+              <div className={`visitor-stage ${asset ? "has-video" : ""} ${avatarConfig?.enabled && mode === "avatar_captions" && avatarActivated ? "has-avatar" : ""}`}>
+                {avatarConfig?.enabled && mode === "avatar_captions" && avatarActivated ? (
                   <AvatarStage
                     ref={avatarRef}
                     config={avatarConfig}
@@ -1245,7 +1283,12 @@ function AccessGate({ onSession }: { onSession: (session: SessionInfo, runtime: 
             <button
               type="button"
               className="secondary-button wide"
-              onClick={() => onSession({ sessionId: "local-demo-session", siteId: "local-demo", expiresAt: new Date(Date.now() + 60 * 60_000).toISOString() }, "demo")}
+              onClick={() => onSession({
+                sessionId: "local-demo-session",
+                siteId: "local-demo",
+                expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+                consentVersion: CURRENT_CONSENT_VERSION,
+              }, "demo")}
             >
               <Icon name="flask" /> Explore local demo
             </button>
@@ -1514,12 +1557,19 @@ const AvatarStage = forwardRef<HandTalkAvatarHandle, {
             error instanceof Error ? error.message : "The avatar could not replay this message.",
           ))}
         ><Icon name="replay" /> Replay</button>
+        <button
+          type="button"
+          disabled={props.state !== "translating" && props.state !== "paused"}
+          onClick={() => void handle()?.stop().catch((error: unknown) => props.onError(
+            error instanceof Error ? error.message : "The avatar could not stop this message.",
+          ))}
+        >Stop</button>
         <label>
           <span className="sr-only">Avatar speed</span>
           <select defaultValue="normal" onChange={(event) => handle()?.changeSpeed(event.target.value as "normal" | "slow" | "fast")}>
-            <option value="slow">0.5×</option>
-            <option value="normal">1×</option>
-            <option value="fast">1.5×</option>
+            <option value="slow">Slow</option>
+            <option value="normal">Standard</option>
+            <option value="fast">Fast</option>
           </select>
         </label>
       </div>
@@ -1614,7 +1664,7 @@ function MetricCard({ label, value, detail, icon }: { label: string; value: stri
 }
 
 function StateBadge({ state }: { state: ProcessState }): ReactNode {
-  const labels: Record<ProcessState, string> = { idle: "Ready", preparing: "Preparing", listening: "Listening", finalizing: "Finalizing", classifying: "Checking phrase", candidate: "Staff review", avatar_confirmation: "Avatar confirmation", fallback: "Caption ready", playing: "ASL + caption" };
+  const labels: Record<ProcessState, string> = { idle: "Ready", preparing: "Preparing", listening: "Listening", finalizing: "Finalizing", classifying: "Checking phrase", caption_ready: "Caption ready", candidate: "Staff review", avatar_confirmation: "Avatar confirmation", fallback: "Safe fallback", playing: "ASL + caption" };
   return <span className={`state-badge ${state}`}><span />{labels[state]}</span>;
 }
 

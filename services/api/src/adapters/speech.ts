@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { v2, protos } from "@google-cloud/speech";
-import type { AppConfig } from "../config.js";
+import {
+  isGoogleSpeechModelLocationSupported,
+  type AppConfig,
+} from "../config.js";
 import type { SpeechSegment } from "../domain.js";
 
 export interface UploadTranscriptionInput {
@@ -33,6 +36,15 @@ export class ProviderUnavailableError extends Error {
     super(message);
     this.name = "ProviderUnavailableError";
   }
+}
+
+const GOOGLE_LOCATION_PATTERN = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+export function speechApiEndpointForLocation(location: string): string {
+  if (!GOOGLE_LOCATION_PATTERN.test(location)) {
+    throw new Error(`Invalid Google Speech-to-Text location: ${location}`);
+  }
+  return location === "global" ? "speech.googleapis.com" : `${location}-speech.googleapis.com`;
 }
 
 export class LocalUnavailableSpeechProvider implements SpeechProvider {
@@ -109,15 +121,22 @@ function mapStreamingResults(
 export class GoogleSpeechProvider implements SpeechProvider {
   readonly providerName = "google-cloud-speech" as const;
   readonly model: string;
+  readonly apiEndpoint: string;
   readonly #client: v2.SpeechClient;
   readonly #recognizer: string;
 
-  constructor(config: AppConfig, client = new v2.SpeechClient()) {
+  constructor(config: AppConfig, client?: v2.SpeechClient) {
     if (!config.googleCloudProject) {
       throw new Error("GOOGLE_CLOUD_PROJECT is required for Google Speech-to-Text");
     }
+    if (!isGoogleSpeechModelLocationSupported(config.googleSpeechModel, config.googleSpeechLocation)) {
+      throw new Error(
+        "chirp_3 requires a currently supported GA location: us, eu, asia-northeast1, or asia-southeast1",
+      );
+    }
     this.model = config.googleSpeechModel;
-    this.#client = client;
+    this.apiEndpoint = speechApiEndpointForLocation(config.googleSpeechLocation);
+    this.#client = client ?? new v2.SpeechClient({ apiEndpoint: this.apiEndpoint });
     this.#recognizer = `projects/${config.googleCloudProject}/locations/${config.googleSpeechLocation}/recognizers/${config.googleSpeechRecognizer}`;
   }
 

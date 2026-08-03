@@ -116,7 +116,6 @@ export const HandTalkAvatar = forwardRef<HandTalkAvatarHandle, HandTalkAvatarPro
         await waitForApplicationState(api, ["ready"]);
       }
 
-      updateState("translating");
       await api.translate(normalized);
       await waitForApplicationState(api, ["ready", "minimized"]);
       if (generation === queueGenerationRef.current) updateState("ready");
@@ -150,7 +149,6 @@ export const HandTalkAvatar = forwardRef<HandTalkAvatarHandle, HandTalkAvatarPro
       repeat: async () => {
         const api = apiRef.current;
         if (!api) throw new Error("The ASL avatar is not ready.");
-        updateState("translating");
         await api.repeat();
       },
       stop: async () => {
@@ -381,18 +379,37 @@ async function waitForApplicationState(
   if (accepted.includes(current)) return current;
 
   return new Promise((resolve, reject) => {
+    let settled = false;
     let unsubscribe = (): void => undefined;
-    const timer = window.setTimeout(() => {
+    let timer: number | undefined;
+    const finish = (next: string): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+      unsubscribe();
+      resolve(next);
+    };
+    const subscribedUnsubscribe = api.onApplicationStateChange((applicationState) => {
+      const next = normalizedApplicationState(applicationState);
+      if (accepted.includes(next)) finish(next);
+    });
+    unsubscribe = subscribedUnsubscribe;
+    if (settled) {
+      unsubscribe();
+      return;
+    }
+    const afterSubscription = normalizedApplicationState(api.getApplicationState());
+    if (accepted.includes(afterSubscription)) {
+      finish(afterSubscription);
+      return;
+    }
+    if (settled) return;
+    timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
       unsubscribe();
       reject(new Error("The ASL avatar did not become ready in time."));
     }, timeoutMs);
-    unsubscribe = api.onApplicationStateChange((applicationState) => {
-      const next = normalizedApplicationState(applicationState);
-      if (!accepted.includes(next)) return;
-      window.clearTimeout(timer);
-      unsubscribe();
-      resolve(next);
-    });
   });
 }
 

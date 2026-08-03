@@ -1,5 +1,6 @@
 import type {
   DetectedIntent,
+  ExperienceMode,
   ReceptionIntentId,
   StableUtterance,
   UnsupportedReasonCode,
@@ -71,6 +72,7 @@ export interface UsageEvent {
     | "latency_sample"
     | "operations_report";
   flow?: "live" | "upload" | "typed" | "manual";
+  outputLane?: ExperienceMode;
   speechProvider?: string;
   speechModel?: string;
   classifierProvider?: "gemini" | "local-demo";

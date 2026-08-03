@@ -1,4 +1,4 @@
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   AccessCodeExchangeRequestSchema,
   AccessCodeExchangeResponseSchema,
@@ -8,6 +8,7 @@ import {
   AvatarExecutionEventRequestSchema,
   AvatarExecutionEventResponseSchema,
   AvatarRuntimeConfigResponseSchema,
+  AudioTranscriptionQuerySchema,
   AudioTranscriptionResponseSchema,
   CatalogPublicResponseSchema,
   DecisionRequestSchema,
@@ -21,6 +22,7 @@ import {
   isAssetRevoked,
   runAvatarSafetyGate,
   type AudioSession,
+  type ExperienceMode,
   type ReceptionIntentId,
   type UnsupportedReasonCode,
 } from "@signbridge/contracts";
@@ -32,6 +34,7 @@ import { AssetUnavailableError } from "./adapters/assets.js";
 import { ProviderUnavailableError } from "./adapters/speech.js";
 import { authenticateInternalRequest } from "./internal-auth.js";
 import { TranscriptionFallbackError } from "./transcription-service.js";
+import { MemoryAvatarExecutionGrantStore } from "./avatar-execution-grants.js";
 import {
   clearSessionCookie,
   createSession,
@@ -61,6 +64,8 @@ export async function registerRoutes(app: FastifyInstance, dependencies: AppDepe
     events,
     transcription,
   } = dependencies;
+  const avatarExecutionGrants = new MemoryAvatarExecutionGrantStore(config.sessionSecret);
+  app.addHook("onClose", async () => avatarExecutionGrants.dispose());
 
   app.get("/api/health", async () => ({
     status: "ok",
@@ -177,7 +182,7 @@ export async function registerRoutes(app: FastifyInstance, dependencies: AppDepe
       return AvatarAuthorizationResponseSchema.parse(gate);
     }
 
-    const authorizationId = createAvatarAuthorizationId(auth.sessionId, config.sessionSecret);
+    const authorizationId = avatarExecutionGrants.issue(auth.sessionId, gate.normalizedText);
     await events.record({
       eventId: randomUUID(),
       occurredAt: new Date().toISOString(),
@@ -205,10 +210,10 @@ export async function registerRoutes(app: FastifyInstance, dependencies: AppDepe
     if (!config.handtalkToken) return reply.code(503).send({ error: "avatar_unavailable" });
     const parsed = AvatarExecutionEventRequestSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_avatar_event" });
-    if (!verifyAvatarAuthorizationId(
+    if (!avatarExecutionGrants.acceptEvent(
       parsed.data.authorizationId,
       auth.sessionId,
-      config.sessionSecret,
+      parsed.data.result,
     )) {
       return reply.code(409).send({ error: "avatar_event_not_authorized" });
     }
@@ -231,6 +236,9 @@ export async function registerRoutes(app: FastifyInstance, dependencies: AppDepe
   app.post("/api/audio/transcribe", { preHandler: requireSite }, async (request, reply) => {
     const auth = request.authSession;
     if (!auth) return reply.code(401).send({ error: "authentication_required" });
+    const parsedQuery = AudioTranscriptionQuerySchema.safeParse(request.query);
+    if (!parsedQuery.success) return reply.code(400).send({ error: "invalid_output_lane" });
+    const { outputLane } = parsedQuery.data;
     let part;
     try {
       part = await request.file({ limits: { fileSize: MAX_UPLOAD_BYTES, files: 1 } });
@@ -257,11 +265,13 @@ export async function registerRoutes(app: FastifyInstance, dependencies: AppDepe
       const verifiedDurationMs = inspectAudioDurationMs(bytes, mimeType);
       if (verifiedDurationMs == null) {
         await recordTranscriptionTerminal(dependencies, auth.siteId, auth.sessionId, "upload", {
+          outputLane,
           fallbackReason: "invalid_audio",
           latencyMs: Date.now() - startedAt,
         });
         return reply.code(422).send(
           AudioTranscriptionResponseSchema.parse({
+            outputLane,
             session: completeSession(session, "failed"),
             segments: [],
             stableUtterances: [],
@@ -272,11 +282,13 @@ export async function registerRoutes(app: FastifyInstance, dependencies: AppDepe
       }
       if (verifiedDurationMs > 60_000) {
         await recordTranscriptionTerminal(dependencies, auth.siteId, auth.sessionId, "upload", {
+          outputLane,
           fallbackReason: "audio_too_long",
           latencyMs: Date.now() - startedAt,
         });
         return reply.code(413).send(
           AudioTranscriptionResponseSchema.parse({
+            outputLane,
             session: completeSession(session, "failed"),
             segments: [],
             stableUtterances: [],
@@ -294,11 +306,13 @@ export async function registerRoutes(app: FastifyInstance, dependencies: AppDepe
       const unavailable = error instanceof ProviderUnavailableError;
       request.log.warn({ provider: transcription.speech.providerName }, "audio transcription failed");
       await recordTranscriptionTerminal(dependencies, auth.siteId, auth.sessionId, "upload", {
+        outputLane,
         fallbackReason: "invalid_audio",
         latencyMs: Date.now() - startedAt,
       });
       return reply.code(unavailable ? 503 : 422).send(
         AudioTranscriptionResponseSchema.parse({
+          outputLane,
           session: completeSession(session, "failed"),
           segments: [],
           stableUtterances: [],
@@ -315,11 +329,13 @@ export async function registerRoutes(app: FastifyInstance, dependencies: AppDepe
       .map((segment, index) => transcription.toTranscriptSegment(session.id, index, segment));
     if (segments.some((segment) => segment.endMs > 60_000)) {
       await recordTranscriptionTerminal(dependencies, auth.siteId, auth.sessionId, "upload", {
+        outputLane,
         fallbackReason: "audio_too_long",
         latencyMs: Date.now() - startedAt,
       });
       return reply.code(413).send(
         AudioTranscriptionResponseSchema.parse({
+          outputLane,
           session: completeSession(session, "failed"),
           segments: [],
           stableUtterances: [],
@@ -330,10 +346,12 @@ export async function registerRoutes(app: FastifyInstance, dependencies: AppDepe
     }
     if (segments.length === 0) {
       await recordTranscriptionTerminal(dependencies, auth.siteId, auth.sessionId, "upload", {
+        outputLane,
         fallbackReason: "no_final_transcript",
         latencyMs: Date.now() - startedAt,
       });
       return AudioTranscriptionResponseSchema.parse({
+        outputLane,
         session: completeSession(session, "failed"),
         segments: [],
         stableUtterances: [],
@@ -342,15 +360,50 @@ export async function registerRoutes(app: FastifyInstance, dependencies: AppDepe
       });
     }
 
+    if (outputLane !== "asl_captions") {
+      try {
+        const utterance = transcription.stabilizeFinalSegments(session, segments);
+        await recordTranscriptionTerminal(dependencies, auth.siteId, auth.sessionId, "upload", {
+          outputLane,
+          latencyMs: Date.now() - startedAt,
+        });
+        return AudioTranscriptionResponseSchema.parse({
+          outputLane,
+          session: completeSession(session, "complete"),
+          segments,
+          stableUtterances: [utterance],
+          detectedIntents: [],
+        });
+      } catch (error) {
+        const reasonCode: UnsupportedReasonCode =
+          error instanceof TranscriptionFallbackError ? error.reasonCode : "transcript_too_long";
+        await recordTranscriptionTerminal(dependencies, auth.siteId, auth.sessionId, "upload", {
+          outputLane,
+          fallbackReason: reasonCode,
+          latencyMs: Date.now() - startedAt,
+        });
+        return AudioTranscriptionResponseSchema.parse({
+          outputLane,
+          session: completeSession(session, "complete"),
+          segments,
+          stableUtterances: [],
+          detectedIntents: [],
+          fallbackReason: reasonCode,
+        });
+      }
+    }
+
     try {
       const bundle = await transcription.classifyFinalSegments(auth, session, segments, "upload");
       await recordTranscriptionTerminal(dependencies, auth.siteId, auth.sessionId, "upload", {
+        outputLane,
         ...(bundle.detectedIntent.status === "supported"
           ? { intentId: bundle.detectedIntent.intentId }
           : { fallbackReason: bundle.detectedIntent.reasonCode }),
         latencyMs: Date.now() - startedAt,
       });
       return AudioTranscriptionResponseSchema.parse({
+        outputLane,
         session: completeSession(session, "complete"),
         segments,
         stableUtterances: [bundle.utterance],
@@ -363,10 +416,12 @@ export async function registerRoutes(app: FastifyInstance, dependencies: AppDepe
       const reasonCode: UnsupportedReasonCode =
         error instanceof TranscriptionFallbackError ? error.reasonCode : "model_unavailable";
       await recordTranscriptionTerminal(dependencies, auth.siteId, auth.sessionId, "upload", {
+        outputLane,
         fallbackReason: reasonCode,
         latencyMs: Date.now() - startedAt,
       });
       return AudioTranscriptionResponseSchema.parse({
+        outputLane,
         session: completeSession(session, "complete"),
         segments,
         stableUtterances: [],
@@ -608,40 +663,6 @@ function avatarFlow(source: "speech" | "upload" | "type" | "phrase"): "live" | "
   return source;
 }
 
-function createAvatarAuthorizationId(sessionId: string, secret: string): string {
-  const requestId = randomUUID();
-  const expiresAt = Math.floor((Date.now() + 5 * 60_000) / 1_000).toString(36);
-  const signature = avatarAuthorizationSignature(sessionId, requestId, expiresAt, secret);
-  return `${requestId}.${expiresAt}.${signature}`;
-}
-
-function verifyAvatarAuthorizationId(
-  authorizationId: string,
-  sessionId: string,
-  secret: string,
-): boolean {
-  const [requestId, expiresAt, signature, ...extra] = authorizationId.split(".");
-  if (!requestId || !expiresAt || !signature || extra.length > 0) return false;
-  const expirySeconds = Number.parseInt(expiresAt, 36);
-  if (!Number.isFinite(expirySeconds) || expirySeconds * 1_000 <= Date.now()) return false;
-  const expected = avatarAuthorizationSignature(sessionId, requestId, expiresAt, secret);
-  const actualBytes = Buffer.from(signature);
-  const expectedBytes = Buffer.from(expected);
-  return actualBytes.length === expectedBytes.length && timingSafeEqual(actualBytes, expectedBytes);
-}
-
-function avatarAuthorizationSignature(
-  sessionId: string,
-  requestId: string,
-  expiresAt: string,
-  secret: string,
-): string {
-  return createHmac("sha256", secret)
-    .update(`${sessionId}:${requestId}:${expiresAt}`)
-    .digest("base64url")
-    .slice(0, 22);
-}
-
 function normalizePendingReason(reason: string): UnsupportedReasonCode {
   return reason === "matched_supported_intent" ? "unknown_intent" : (reason as UnsupportedReasonCode);
 }
@@ -670,6 +691,7 @@ async function recordTranscriptionTerminal(
   sessionId: string,
   flow: "live" | "upload",
   outcome: {
+    outputLane?: ExperienceMode;
     fallbackReason?: UnsupportedReasonCode;
     intentId?: ReceptionIntentId;
     latencyMs?: number;
@@ -682,6 +704,7 @@ async function recordTranscriptionTerminal(
     sessionId,
     type: "transcription_completed",
     flow,
+    ...(outcome.outputLane ? { outputLane: outcome.outputLane } : {}),
     speechProvider: dependencies.transcription.speech.providerName,
     speechModel: dependencies.transcription.speech.model,
     ...(outcome.fallbackReason ? { fallbackReason: outcome.fallbackReason } : {}),

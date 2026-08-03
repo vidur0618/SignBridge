@@ -90,7 +90,7 @@ Set:
 USE_GOOGLE_CLOUD=true
 GOOGLE_CLOUD_PROJECT=<project-id>
 GOOGLE_CLOUD_LOCATION=<Vertex location, currently defaulting to global>
-GOOGLE_SPEECH_LOCATION=<recognizer location, currently defaulting to global>
+GOOGLE_SPEECH_LOCATION=<recognizer location, defaulting to us for chirp_3>
 GOOGLE_SPEECH_RECOGNIZER=<recognizer ID or _>
 GOOGLE_SPEECH_MODEL=<deployed model, currently configured as chirp_3>
 GEMINI_MODEL=<Vertex publisher model available in that project/location>
@@ -101,7 +101,9 @@ FIRESTORE_DATABASE=<database ID>
 `GOOGLE_CLOUD_PROJECT` and `SIGN_ASSET_BUCKET` are mandatory when cloud mode is enabled. Google client libraries use Application Default Credentials:
 
 - on Cloud Run, attach a least-privilege service account with only the required Speech-to-Text, Vertex AI, bucket-signing/read, and Firestore permissions;
-- for an authorized local smoke test, use `gcloud auth application-default login`, or set `GOOGLE_APPLICATION_CREDENTIALS` to a narrowly scoped service-account file stored outside Git.
+- for an authorized local smoke test, use native Windows user ADC from `gcloud auth application-default login`; do not create a service-account key for this workflow.
+
+Native Windows setup and the regional Chirp 3 smoke-test evidence steps are documented in [`docs/google-cloud-windows-setup.md`](docs/google-cloud-windows-setup.md). The Linux `setup_adc.sh` sample is not the correct bootstrap for this native Windows process.
 
 Do not paste access tokens or service-account JSON into this repository. The default `GEMINI_MODEL=gemini-3.6-flash` is a configuration value, not proof that the model is available through Vertex in the chosen project/location. Confirm it with an authorized minimal request before deployment.
 
@@ -208,6 +210,8 @@ scripts/                 Catalog, line-ending, and secret-pattern checks
 - [`docs/release-checklist.md`](docs/release-checklist.md) is the existing launch gate and must be reconciled with the newer hybrid boundary before launch.
 - [`docs/evaluation-plan.md`](docs/evaluation-plan.md) separates reviewed and experimental acceptance.
 - [`docs/privacy-security.md`](docs/privacy-security.md) documents Google and Hand Talk data/credential boundaries.
+- [`docs/avatar-provider-decision.md`](docs/avatar-provider-decision.md) records the provider and cost decision with its unresolved commercial and human-review gates.
+- [`docs/google-cloud-windows-setup.md`](docs/google-cloud-windows-setup.md) gives the native Windows ADC and regional Speech setup path.
 - [`docs/claims-ledger.md`](docs/claims-ledger.md) states what may be claimed today.
 - [`CODEX_USAGE.md`](CODEX_USAGE.md) records Codex's actual role and non-actions.
 - [`DEVPOST_SUBMISSION.md`](DEVPOST_SUBMISSION.md) remains an evidence template, not a completed submission.

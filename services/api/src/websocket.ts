@@ -4,6 +4,7 @@ import {
   LiveClientMessageSchema,
   LiveServerEventSchema,
   type AudioSession,
+  type ExperienceMode,
   type LiveServerEvent,
   type ReceptionIntentId,
   type TranscriptSegment,
@@ -39,6 +40,7 @@ export async function registerLiveTranscription(
       }
 
       let session: AudioSession | null = null;
+      let outputLane: ExperienceMode | null = null;
       let speech: LiveSpeechConnection | null = null;
       let acquired = false;
       let closed = false;
@@ -76,6 +78,7 @@ export async function registerLiveTranscription(
           sessionId: auth.sessionId,
           type: "transcription_completed",
           flow: "live",
+          ...(outputLane ? { outputLane } : {}),
           speechProvider: dependencies.transcription.speech.providerName,
           speechModel: dependencies.transcription.speech.model,
           ...(outcome.fallbackReason ? { fallbackReason: outcome.fallbackReason } : {}),
@@ -107,53 +110,57 @@ export async function registerLiveTranscription(
               latencyMs: Math.max(0, Date.now() - stoppedAt),
             });
           }
-          try {
-            const bundle = await dependencies.transcription.classifyFinalSegments(
-              auth,
-              session,
-              finalSegments,
-              "live",
-            );
-            if (bundle.detectedIntent.status === "supported") {
-              send(socket, {
-                type: "intent.candidate",
-                utterance: bundle.utterance,
-                detectedIntent: bundle.detectedIntent,
-              });
-            } else {
-              send(socket, {
-                type: "fallback",
-                sessionId: session.id,
-                utteranceId: bundle.utterance.id,
-                reasonCode: bundle.detectedIntent.reasonCode,
-              });
-            }
-            await recordTerminal(
-              bundle.detectedIntent.status === "supported"
-                ? { intentId: bundle.detectedIntent.intentId }
-                : { fallbackReason: bundle.detectedIntent.reasonCode },
-            );
-          } catch (error) {
-            const reasonCode: UnsupportedReasonCode =
-              error instanceof TranscriptionFallbackError
-                ? error.reasonCode
-                : "model_unavailable";
-            if (error instanceof TranscriptionFallbackError) {
-              send(socket, {
-                type: "fallback",
-                sessionId: session.id,
-                reasonCode,
-              });
-            } else {
-              sendError(
-                socket,
-                session.id,
-                reasonCode,
-                true,
-                "Captions remain available, but no phrase candidate could be created.",
+          if (outputLane !== "asl_captions") {
+            await recordTerminal();
+          } else {
+            try {
+              const bundle = await dependencies.transcription.classifyFinalSegments(
+                auth,
+                session,
+                finalSegments,
+                "live",
               );
+              if (bundle.detectedIntent.status === "supported") {
+                send(socket, {
+                  type: "intent.candidate",
+                  utterance: bundle.utterance,
+                  detectedIntent: bundle.detectedIntent,
+                });
+              } else {
+                send(socket, {
+                  type: "fallback",
+                  sessionId: session.id,
+                  utteranceId: bundle.utterance.id,
+                  reasonCode: bundle.detectedIntent.reasonCode,
+                });
+              }
+              await recordTerminal(
+                bundle.detectedIntent.status === "supported"
+                  ? { intentId: bundle.detectedIntent.intentId }
+                  : { fallbackReason: bundle.detectedIntent.reasonCode },
+              );
+            } catch (error) {
+              const reasonCode: UnsupportedReasonCode =
+                error instanceof TranscriptionFallbackError
+                  ? error.reasonCode
+                  : "model_unavailable";
+              if (error instanceof TranscriptionFallbackError) {
+                send(socket, {
+                  type: "fallback",
+                  sessionId: session.id,
+                  reasonCode,
+                });
+              } else {
+                sendError(
+                  socket,
+                  session.id,
+                  reasonCode,
+                  true,
+                  "Captions remain available, but no phrase candidate could be created.",
+                );
+              }
+              await recordTerminal({ fallbackReason: reasonCode });
             }
-            await recordTerminal({ fallbackReason: reasonCode });
           }
         }
         if (session) send(socket, { type: "speech_end", sessionId: session.id });
@@ -220,6 +227,7 @@ export async function registerLiveTranscription(
               return;
             }
             acquired = true;
+            outputLane = parsed.data.outputLane;
             configuredAt = Date.now();
             session = dependencies.transcription.createAudioSession(
               auth,

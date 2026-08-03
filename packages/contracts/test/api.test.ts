@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   AudioTranscriptionResponseSchema,
+  AudioTranscriptionQuerySchema,
   DecisionResponseSchema,
   DecisionRequestSchema,
   DetectedIntentSchema,
   FeedbackRequestSchema,
+  LiveSessionConfigSchema,
   LiveServerEventSchema,
 } from "../src/index.js";
 
@@ -24,6 +26,36 @@ const partial = {
 };
 
 describe("websocket contracts", () => {
+  it.each(["captions_only", "asl_captions", "avatar_captions"] as const)(
+    "accepts the explicit %s output lane",
+    (outputLane) => {
+      expect(LiveSessionConfigSchema.safeParse({
+        type: "session.configure",
+        sessionId: "session-1",
+        siteId: "site-1",
+        locale: "en-US",
+        consentVersion: "v1",
+        outputLane,
+        audio: { encoding: "LINEAR16", sampleRateHertz: 16_000, channelCount: 1 },
+        retention: "none",
+      }).success).toBe(true);
+    },
+  );
+
+  it("rejects a missing or unknown live output lane", () => {
+    const base = {
+      type: "session.configure",
+      sessionId: "session-1",
+      siteId: "site-1",
+      locale: "en-US",
+      consentVersion: "v1",
+      audio: { encoding: "LINEAR16", sampleRateHertz: 16_000, channelCount: 1 },
+      retention: "none",
+    };
+    expect(LiveSessionConfigSchema.safeParse(base).success).toBe(false);
+    expect(LiveSessionConfigSchema.safeParse({ ...base, outputLane: "automatic_asl" }).success).toBe(false);
+  });
+
   it("keeps provisional and final transcript event types distinct", () => {
     expect(LiveServerEventSchema.safeParse({ type: "transcript.partial", segment: partial }).success).toBe(true);
     expect(LiveServerEventSchema.safeParse({ type: "transcript.final", segment: partial }).success).toBe(false);
@@ -58,9 +90,17 @@ describe("websocket contracts", () => {
 });
 
 describe("REST payload contracts", () => {
+  it("accepts only one strict upload output-lane query parameter", () => {
+    expect(AudioTranscriptionQuerySchema.safeParse({ outputLane: "captions_only" }).success).toBe(true);
+    expect(AudioTranscriptionQuerySchema.safeParse({ outputLane: "avatar_captions" }).success).toBe(true);
+    expect(AudioTranscriptionQuerySchema.safeParse({ outputLane: "automatic_asl" }).success).toBe(false);
+    expect(AudioTranscriptionQuerySchema.safeParse({ outputLane: "asl_captions", assetId: "attacker" }).success).toBe(false);
+  });
+
   it("rejects partials in uploaded-audio finalized responses", () => {
     expect(
       AudioTranscriptionResponseSchema.safeParse({
+        outputLane: "asl_captions",
         session: {
           id: "session-1",
           siteId: "site-1",

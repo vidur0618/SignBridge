@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ExperienceMode } from "@signbridge/contracts";
 import type { SpeechProvider } from "./adapters/speech.js";
 import { authenticate, makeTestApp, supportedClassifier } from "./test-helpers.js";
 
@@ -95,9 +96,85 @@ describe("uploaded-audio route limits and fallback mapping", () => {
     expect(classify).toHaveBeenCalledOnce();
     expect(classify).toHaveBeenCalledWith("Welcome");
     expect(response.json()).toMatchObject({
+      outputLane: "asl_captions",
       stableUtterances: [{ transcript: "Welcome" }],
       detectedIntents: [{ status: "supported", intentId: "greeting" }],
     });
+  });
+
+  it.each(["captions_only", "avatar_captions"] as const)(
+    "returns a stable %s upload without invoking the reviewed-phrase classifier",
+    async (outputLane) => {
+      const classifier = supportedClassifier();
+      const classify = vi.spyOn(classifier, "classify");
+      const transcribeUpload = vi.fn(async () => [
+        {
+          id: randomUUID(),
+          text: "Welcome",
+          isFinal: true,
+          startedAtMs: 0,
+          endedAtMs: 1_000,
+          provider: "google-cloud-speech" as const,
+          model: "chirp_3",
+        },
+      ]);
+      const { app, events } = await makeTestApp({
+        classifier,
+        speech: speechWith(transcribeUpload),
+      });
+      apps.push(app);
+      const login = await authenticate(app);
+
+      const response = await upload(
+        app,
+        login.cookie,
+        "audio/wav",
+        makeWav(8_000),
+        outputLane,
+      );
+
+      expect(response.statusCode).toBe(200);
+      expect(classify).not.toHaveBeenCalled();
+      expect(response.json()).toMatchObject({
+        outputLane,
+        stableUtterances: [{ transcript: "Welcome", isFinal: true }],
+        detectedIntents: [],
+      });
+      expect(response.json()).not.toHaveProperty("fallbackReason");
+      const terminal = events.events.find((event) => event.type === "transcription_completed");
+      expect(terminal).toMatchObject({
+        flow: "upload",
+        outputLane,
+        speechProvider: "google-cloud-speech",
+        speechModel: "chirp_3",
+      });
+      expect(terminal?.classifierProvider).toBeUndefined();
+      expect(terminal?.classifierModel).toBeUndefined();
+      expect(terminal?.classifierInvocationId).toBeUndefined();
+      expect(terminal?.fallbackReason).toBeUndefined();
+    },
+  );
+
+  it("rejects a missing upload output lane before Speech-to-Text", async () => {
+    const transcribeUpload = vi.fn(async () => []);
+    const { app } = await makeTestApp({ speech: speechWith(transcribeUpload) });
+    apps.push(app);
+    const login = await authenticate(app);
+    const boundary = "signbridge-test-boundary";
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/audio/transcribe",
+      headers: {
+        cookie: login.cookie,
+        origin: "http://127.0.0.1:4173",
+        "content-type": `multipart/form-data; boundary=${boundary}`,
+      },
+      payload: Buffer.from(`--${boundary}--\r\n`),
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ error: "invalid_output_lane" });
+    expect(transcribeUpload).not.toHaveBeenCalled();
   });
 
   it("protects the scheduled operations route from unauthenticated callers", async () => {
@@ -126,6 +203,7 @@ async function upload(
   cookie: string,
   mimeType: string,
   bytes: Buffer,
+  outputLane: ExperienceMode = "asl_captions",
 ) {
   const boundary = "signbridge-test-boundary";
   const prefix = Buffer.from(
@@ -134,7 +212,7 @@ async function upload(
   const suffix = Buffer.from(`\r\n--${boundary}--\r\n`);
   return app.inject({
     method: "POST",
-    url: "/api/audio/transcribe",
+    url: `/api/audio/transcribe?outputLane=${outputLane}`,
     headers: {
       cookie,
       origin: "http://127.0.0.1:4173",

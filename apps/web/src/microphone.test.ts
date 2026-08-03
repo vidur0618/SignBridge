@@ -113,4 +113,57 @@ describe("PcmMicrophone", () => {
     expect(stopTrack).toHaveBeenCalledOnce();
     expect(closeContext).toHaveBeenCalledOnce();
   });
+
+  it("flushes the final PCM frame before tearing down capture", async () => {
+    const order: string[] = [];
+    const stream = { getTracks: () => [{ stop: () => order.push("track_stopped") }] } as unknown as MediaStream;
+    const source = { connect: vi.fn(), disconnect: vi.fn() };
+    const gain = { gain: { value: 1 }, connect: vi.fn(), disconnect: vi.fn() };
+    const finalFrame = new ArrayBuffer(16);
+
+    class AudioWorkletNodeStub {
+      readonly port = {
+        onmessage: null as ((event: MessageEvent<unknown>) => void) | null,
+        postMessage: (message: { type?: string; requestId?: number }) => {
+          order.push("flush_requested");
+          this.port.onmessage?.({ data: finalFrame } as MessageEvent<unknown>);
+          this.port.onmessage?.({
+            data: { type: "flushed", requestId: message.requestId },
+          } as MessageEvent<unknown>);
+        },
+      };
+      connect(): void {}
+      disconnect(): void { order.push("worklet_disconnected"); }
+    }
+
+    class AudioContextStub {
+      readonly audioWorklet = { addModule: vi.fn().mockResolvedValue(undefined) };
+      readonly destination = {};
+      createMediaStreamSource(): typeof source { return source; }
+      createGain(): typeof gain { return gain; }
+      async close(): Promise<void> { order.push("context_closed"); }
+    }
+
+    vi.stubGlobal("navigator", {
+      mediaDevices: { getUserMedia: vi.fn().mockResolvedValue(stream) },
+    });
+    vi.stubGlobal("window", { AudioWorkletNode: AudioWorkletNodeStub });
+    vi.stubGlobal("AudioWorkletNode", AudioWorkletNodeStub);
+    vi.stubGlobal("AudioContext", AudioContextStub);
+
+    const microphone = new PcmMicrophone();
+    await microphone.start((frame) => {
+      expect(frame).toBe(finalFrame);
+      order.push("frame_forwarded");
+    });
+    await microphone.stop({ flush: true });
+
+    expect(order).toEqual([
+      "flush_requested",
+      "frame_forwarded",
+      "track_stopped",
+      "worklet_disconnected",
+      "context_closed",
+    ]);
+  });
 });

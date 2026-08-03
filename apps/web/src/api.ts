@@ -14,6 +14,7 @@ import {
   type AvatarMessageSource,
   type DecisionRequest,
   type FeedbackRequest,
+  type ExperienceMode,
 } from "@signbridge/contracts";
 import type {
   AvatarRuntimeConfig,
@@ -37,10 +38,13 @@ export class ApiError extends Error {
   }
 }
 
+export const CURRENT_CONSENT_VERSION = "v2026-08-02-avatar";
+
 export interface SessionInfo {
   sessionId: string;
   siteId: string;
   expiresAt: string;
+  consentVersion: typeof CURRENT_CONSENT_VERSION;
 }
 
 async function requestJson(path: string, init?: RequestInit): Promise<unknown> {
@@ -74,7 +78,7 @@ function publicErrorMessage(code: string | undefined): string {
 export async function exchangeSession(accessCode: string): Promise<SessionInfo> {
   const body: AccessCodeExchangeRequest = {
     accessCode,
-    consentVersion: "v2026-08-02-avatar",
+    consentVersion: CURRENT_CONSENT_VERSION,
   };
   const payload = parseContract(AccessCodeExchangeResponseSchema.safeParse(await requestJson("/api/session/exchange", {
     method: "POST",
@@ -84,6 +88,7 @@ export async function exchangeSession(accessCode: string): Promise<SessionInfo> 
     sessionId: payload.sessionId,
     siteId: payload.siteId,
     expiresAt: payload.expiresAt,
+    consentVersion: CURRENT_CONSENT_VERSION,
   };
 }
 
@@ -147,13 +152,22 @@ export async function reportAvatarExecution(input: AvatarExecutionEventRequest):
 
 export interface TranscriptionResult {
   transcript: string;
-  candidate: IntentCandidate;
+  candidate?: IntentCandidate;
 }
 
-export async function transcribeAudio(file: File): Promise<TranscriptionResult> {
+export async function transcribeAudio(
+  file: File,
+  outputLane: ExperienceMode,
+): Promise<TranscriptionResult> {
   const form = new FormData();
   form.append("audio", file, file.name);
-  const payload = parseContract(AudioTranscriptionResponseSchema.safeParse(await requestJson("/api/audio/transcribe", { method: "POST", body: form })), "audio transcription");
+  const payload = parseContract(AudioTranscriptionResponseSchema.safeParse(await requestJson(
+    `/api/audio/transcribe?outputLane=${encodeURIComponent(outputLane)}`,
+    { method: "POST", body: form },
+  )), "audio transcription");
+  if (payload.outputLane !== outputLane) {
+    throw new ApiError("The server returned an audio response for another output lane.", 502, "invalid_contract");
+  }
   return normalizeTranscriptionResult(payload);
 }
 
@@ -252,7 +266,7 @@ function normalizeTranscriptionResult(payload: Record<string, unknown> | null): 
   const utteranceId = stringValue(utterance?.id ?? detected?.utteranceId ?? payload?.utteranceId) ?? crypto.randomUUID();
   return {
     transcript,
-    candidate: normalizeCandidate(detected, utteranceId, transcript),
+    ...(detected ? { candidate: normalizeCandidate(detected, utteranceId, transcript) } : {}),
   };
 }
 

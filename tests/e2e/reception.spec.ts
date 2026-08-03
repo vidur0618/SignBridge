@@ -134,7 +134,10 @@ async function installMockHandTalkSdk(
           disable() { return Promise.resolve(); }
           translate(sentence) {
             testWindow.handTalkTranslateCalls.push(sentence);
+            this.state = "translating";
+            this.emit();
             this.state = "ready";
+            this.emit();
             return Promise.resolve();
           }
           pause() { this.state = "paused"; this.emit(); }
@@ -162,8 +165,13 @@ async function installMockLiveCapture(
   options: { failFirstConnection?: boolean; emitEarlyFinal?: boolean } = {},
 ): Promise<void> {
   await page.addInitScript((settings) => {
-    const testWindow = window as unknown as { testSocketConnections: number; stoppedTestTracks: number };
+    const testWindow = window as unknown as {
+      testSocketConnections: number;
+      testSocketConfigs: Array<Record<string, unknown>>;
+      stoppedTestTracks: number;
+    };
     testWindow.testSocketConnections = 0;
+    testWindow.testSocketConfigs = [];
     testWindow.stoppedTestTracks = 0;
     const track = { stop: () => { testWindow.stoppedTestTracks += 1; } };
     Object.defineProperty(navigator, "mediaDevices", {
@@ -219,7 +227,29 @@ async function installMockLiveCapture(
 
       send(data: string | ArrayBuffer): void {
         if (typeof data !== "string") return;
-        const message = JSON.parse(data) as { type?: string };
+        const message = JSON.parse(data) as {
+          type?: string;
+          sessionId?: string;
+          siteId?: string;
+          consentVersion?: string;
+        };
+        if (message.type === "session.configure") {
+          testWindow.testSocketConfigs.push(message);
+          window.setTimeout(() => this.emit({
+            type: "session.ready",
+            session: {
+              id: "test-live-audio-session",
+              siteId: message.siteId,
+              mode: "live",
+              locale: "en-US",
+              consentVersion: message.consentVersion,
+              audio: { encoding: "LINEAR16", sampleRateHertz: 16_000, channelCount: 1 },
+              lifecycle: "listening",
+              retention: "none",
+              createdAt: "2026-08-01T12:00:00.000Z",
+            },
+          }), 0);
+        }
         if (message.type === "session.configure" && settings.failFirstConnection) {
           window.setTimeout(() => this.emit({
             type: "transcript.partial",
@@ -280,17 +310,79 @@ async function installMockLiveCapture(
   }, options);
 }
 
+async function installMockMicrophoneOnly(page: import("@playwright/test").Page): Promise<void> {
+  await page.addInitScript(() => {
+    const track = { stop: () => undefined };
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: () => Promise.resolve({
+          getTracks: () => [track],
+        } as unknown as MediaStream),
+      },
+    });
+
+    class TestAudioWorkletNode {
+      readonly port = { onmessage: null as ((event: MessageEvent<ArrayBuffer>) => void) | null };
+      connect(): void {}
+      disconnect(): void {}
+    }
+    class TestAudioContext {
+      readonly audioWorklet = { addModule: () => Promise.resolve() };
+      readonly destination = {};
+      createMediaStreamSource(): { connect: () => void; disconnect: () => void } {
+        return { connect: () => undefined, disconnect: () => undefined };
+      }
+      createGain(): { gain: { value: number }; connect: () => void; disconnect: () => void } {
+        return { gain: { value: 1 }, connect: () => undefined, disconnect: () => undefined };
+      }
+      close(): Promise<void> { return Promise.resolve(); }
+    }
+    Object.defineProperty(window, "AudioWorkletNode", { configurable: true, value: TestAudioWorkletNode });
+    Object.defineProperty(window, "AudioContext", { configurable: true, value: TestAudioContext });
+  });
+}
+
+async function routeReadyLiveSocket(page: import("@playwright/test").Page): Promise<void> {
+  await page.routeWebSocket(/\/api\/live-transcription$/, (socket) => {
+    socket.onMessage((data) => {
+      if (typeof data !== "string") return;
+      const message = JSON.parse(data) as {
+        type?: string;
+        siteId?: string;
+        consentVersion?: string;
+      };
+      if (message.type !== "session.configure") return;
+      socket.send(JSON.stringify({
+        type: "session.ready",
+        session: {
+          id: "test-ready-audio-session",
+          siteId: message.siteId,
+          mode: "live",
+          locale: "en-US",
+          consentVersion: message.consentVersion,
+          audio: { encoding: "LINEAR16", sampleRateHertz: 16_000, channelCount: 1 },
+          lifecycle: "listening",
+          retention: "none",
+          createdAt: "2026-08-01T12:00:00.000Z",
+        },
+      }));
+    });
+  });
+}
+
 function supportedUploadFixture(): Record<string, unknown> {
   const sessionId = "test-upload-session-1";
   const segmentId = "test-segment-1";
   const utteranceId = "test-utterance-1";
   return {
+    outputLane: "asl_captions",
     session: {
       id: sessionId,
       siteId: "test-pilot-site",
       mode: "upload",
       locale: "en-US",
-      consentVersion: "v2026-08-01",
+      consentVersion: "v2026-08-02-avatar",
       audio: { encoding: "WAV", sampleRateHertz: 16_000, channelCount: 1 },
       lifecycle: "complete",
       retention: "none",
@@ -409,9 +501,7 @@ test("production mode falls back safely when microphone permission is denied", a
       value: () => Promise.reject(new DOMException("Microphone permission denied by test fixture.", "NotAllowedError")),
     });
   });
-  await page.routeWebSocket(/\/api\/live-transcription$/, (socket) => {
-    socket.onMessage(() => undefined);
-  });
+  await routeReadyLiveSocket(page);
   await openMockedProduction(page);
 
   await page.getByRole("button", { name: "Start microphone" }).click();
@@ -420,6 +510,24 @@ test("production mode falls back safely when microphone permission is denied", a
   await expect(page.getByText("Microphone permission denied by test fixture.")).toBeVisible();
   await expect(page.getByRole("button", { name: "Approve ASL phrase" })).toHaveCount(0);
   await expect(page.locator("video")).toHaveCount(0);
+});
+
+test("browser client and real local API agree on the live-session consent version", async ({ page }) => {
+  await installMockMicrophoneOnly(page);
+  await page.goto("/");
+  await page.getByLabel("Site access code").fill("signbridge-demo");
+  await page.getByRole("checkbox").check();
+  await page.getByRole("button", { name: "Open reception" }).click();
+  await expect(page.getByRole("heading", { name: "Help every visitor feel understood." })).toBeVisible();
+
+  await page.getByRole("button", { name: "Start microphone" }).click();
+  await page.waitForTimeout(300);
+
+  await expect(page.getByRole("button", { name: "Stop & finalize" })).toBeVisible();
+  await expect(page.getByText("Speech connected")).toBeVisible();
+
+  await page.getByRole("button", { name: "Stop & finalize" }).click();
+  await expect(page.getByRole("heading", { name: "Continue another way" })).toBeVisible();
 });
 
 test("production capture retries one pre-audio socket failure and never classifies a partial", async ({ page }) => {
@@ -431,6 +539,11 @@ test("production capture retries one pre-audio socket failure and never classifi
   await expect.poll(() => page.evaluate(() => (
     window as unknown as { testSocketConnections: number }
   ).testSocketConnections)).toBe(2);
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { testSocketConfigs: Array<Record<string, unknown>> }
+  ).testSocketConfigs.map(({ consentVersion }) => consentVersion))).toEqual([
+    "v2026-08-02-avatar",
+  ]);
   await expect(page.locator(".provisional-caption")).toContainText("Hello, wel…");
   await page.getByRole("button", { name: "Stop & finalize" }).click();
 
@@ -456,6 +569,7 @@ test("an early ASR final does not hide Stop or extend push-to-talk capture", asy
 });
 
 test("canceling delayed microphone permission stops a late-granted stream", async ({ page }) => {
+  await routeReadyLiveSocket(page);
   await page.route("**/api/session", async (route) => {
     await route.fulfill({ json: { ended: true } });
   });
@@ -491,7 +605,8 @@ test("canceling delayed microphone permission stops a late-granted stream", asyn
 });
 
 test("production upload service failure retains a safe captions fallback", async ({ page }) => {
-  await page.route("**/api/audio/transcribe", async (route) => {
+  await page.route("**/api/audio/transcribe?*", async (route) => {
+    expect(new URL(route.request().url()).searchParams.get("outputLane")).toBe("captions_only");
     await route.fulfill({
       status: 503,
       json: {
@@ -517,7 +632,8 @@ test("production upload service failure retains a safe captions fallback", async
 
 test("production playback failure preserves the finalized English caption", async ({ page }) => {
   // These contract-valid route fixtures exercise UI failure handling only. No provider or human review ran.
-  await page.route("**/api/audio/transcribe", async (route) => {
+  await page.route("**/api/audio/transcribe?*", async (route) => {
+    expect(new URL(route.request().url()).searchParams.get("outputLane")).toBe("asl_captions");
     await route.fulfill({ json: supportedUploadFixture() });
   });
   await page.route("**/api/utterances/test-utterance-1/decision", async (route) => {
@@ -610,8 +726,9 @@ test("avatar mode requires activation and per-message confirmation before provid
   await activation.check();
   await enableAvatar.click();
   await expect(page.getByText("Provider ready. Each message still requires separate confirmation.")).toBeVisible();
+  await expect(page.getByText("Experimental ASL avatar ready")).toBeVisible();
   expect(configRequests).toBe(1);
-  expect(sdk.requestCount()).toBe(0);
+  expect(sdk.requestCount()).toBe(1);
 
   const message = "The blue umbrella is waiting beside the chair.";
   await page.getByRole("button", { name: "Type English message" }).click();
@@ -619,14 +736,14 @@ test("avatar mode requires activation and per-message confirmation before provid
   await page.getByRole("button", { name: "Prepare avatar & caption" }).click();
 
   await expect(page.getByRole("heading", { name: "Send this caption to the experimental avatar?" })).toBeVisible();
-  await expect(page.locator(".final-caption p")).toHaveText(message);
+  await expect(page.locator(".video-caption p")).toHaveText(message);
   expect(authorizationBodies).toHaveLength(0);
-  expect(sdk.requestCount()).toBe(0);
+  expect(sdk.requestCount()).toBe(1);
 
   await page.getByRole("button", { name: "Keep captions only" }).click();
-  await expect(page.locator(".final-caption p")).toHaveText(message);
+  await expect(page.locator(".video-caption p")).toHaveText(message);
   expect(authorizationBodies).toHaveLength(0);
-  expect(sdk.requestCount()).toBe(0);
+  expect(sdk.requestCount()).toBe(1);
 
   await page.getByRole("button", { name: "Prepare avatar & caption" }).click();
   await page.getByRole("button", { name: "Confirm avatar message" }).click();
@@ -650,6 +767,9 @@ test("avatar mode requires activation and per-message confirmation before provid
   await expect(page.locator(".video-caption p")).toHaveText(message);
   await expect(page.getByText("English caption · final")).toBeVisible();
   await expect(page.getByText(/Staff confirmed this message/i)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
+  await expect(page.getByLabel("Avatar speed")).toHaveValue("normal");
+  await expect(page.getByLabel("Avatar speed").locator("option")).toHaveText(["Slow", "Standard", "Fast"]);
 });
 
 test("demo speech flow marks provisional text and blocks fake ASL playback", async ({ page }) => {
@@ -680,7 +800,9 @@ test("high-stakes typed content takes the safe fallback", async ({ page }) => {
   await page.getByRole("button", { name: "Show caption" }).click();
 
   await expect(page.getByRole("heading", { name: "Continue another way" })).toBeVisible();
-  await expect(page.getByText(/consequential communication/i)).toBeVisible();
+  await expect(page.locator(".fallback-card").getByText(
+    "This may be consequential communication. Use a qualified interpreter or appropriate support.",
+  )).toBeVisible();
   await expect(page.locator(".final-caption p")).toHaveText("This is a medical emergency and we need a doctor.");
 });
 
@@ -691,8 +813,20 @@ test("captions-only mode never offers ASL approval", async ({ page }) => {
   await page.getByLabel("Message for the visitor").fill("Please wait here.");
   await page.getByRole("button", { name: "Show caption" }).click();
 
-  await expect(page.getByText(/Captions-only mode is active/i)).toBeVisible();
+  await expect(page.getByText("The final caption is ready. No phrase classifier or signing provider was invoked.")).toBeVisible();
+  await expect(page.getByText("Caption ready")).toBeVisible();
   await expect(page.getByRole("button", { name: "Approve ASL phrase" })).toHaveCount(0);
+});
+
+test("captions-only typed text does not run the reception intent classifier", async ({ page }) => {
+  await openDemo(page);
+  await page.getByRole("button", { name: "Type English message" }).click();
+  await page.getByLabel("Message for the visitor").fill("The quarterly board packet is on the printer.");
+  await page.getByRole("button", { name: "Show caption" }).click();
+
+  await expect(page.getByText("The final caption is ready. No phrase classifier or signing provider was invoked.")).toBeVisible();
+  await expect(page.getByText(/outside the ten reception phrases/i)).toHaveCount(0);
+  await expect(page.locator(".final-caption p")).toHaveText("The quarterly board packet is on the printer.");
 });
 
 test("switching to captions only withdraws an already displayed approval choice", async ({ page }) => {

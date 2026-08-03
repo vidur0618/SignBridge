@@ -18,6 +18,18 @@ import {
 export const AudioModeSchema = z.enum(["live", "upload"]);
 export type AudioMode = z.infer<typeof AudioModeSchema>;
 
+/**
+ * The operator-selected output lane. This is intentionally separate from the
+ * audio input mode so choosing captions or the experimental avatar can never
+ * be mistaken for consent to run reviewed-phrase intent classification.
+ */
+export const ExperienceModeSchema = z.enum([
+  "captions_only",
+  "asl_captions",
+  "avatar_captions",
+]);
+export type ExperienceMode = z.infer<typeof ExperienceModeSchema>;
+
 export const AudioConfigurationSchema = z
   .object({
     encoding: z.enum(["LINEAR16", "WAV", "MP3", "WEBM_OPUS"]),
@@ -91,7 +103,7 @@ export const StableUtteranceSchema = z
     id: IdentifierSchema,
     sessionId: IdentifierSchema,
     segmentIds: z.array(IdentifierSchema).min(1).max(100),
-    transcript: z.string().trim().min(1).max(500),
+    transcript: z.string().trim().min(1).max(2_000),
     isFinal: z.literal(true),
     finalizationReason: z.enum(["asr_is_final", "typed_submission", "manual_phrase_selection"]),
     finalizedAt: IsoTimestampSchema,

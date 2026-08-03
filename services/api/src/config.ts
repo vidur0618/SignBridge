@@ -10,6 +10,13 @@ const booleanFromString = z
   .default("false")
   .transform((value) => value === "true");
 
+const CHIRP_3_GA_LOCATIONS = new Set([
+  "us",
+  "eu",
+  "asia-northeast1",
+  "asia-southeast1",
+]);
+
 const EnvSchema = z
   .object({
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
@@ -27,7 +34,10 @@ const EnvSchema = z
     USE_GOOGLE_CLOUD: booleanFromString,
     GOOGLE_CLOUD_PROJECT: z.string().optional(),
     GOOGLE_CLOUD_LOCATION: z.string().default("global"),
-    GOOGLE_SPEECH_LOCATION: z.string().default("global"),
+    GOOGLE_SPEECH_LOCATION: z
+      .string()
+      .regex(/^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/)
+      .default("us"),
     GOOGLE_SPEECH_RECOGNIZER: z.string().default("_"),
     GOOGLE_SPEECH_MODEL: z.string().default("chirp_3"),
     GEMINI_MODEL: z.string().default("gemini-3.6-flash"),
@@ -64,6 +74,14 @@ const EnvSchema = z
         message: "Production requires non-default session and access-code secrets",
       });
     }
+    if (!isGoogleSpeechModelLocationSupported(env.GOOGLE_SPEECH_MODEL, env.GOOGLE_SPEECH_LOCATION)) {
+      context.addIssue({
+        code: "custom",
+        path: ["GOOGLE_SPEECH_LOCATION"],
+        message:
+          "chirp_3 requires a currently supported GA location: us, eu, asia-northeast1, or asia-southeast1",
+      });
+    }
     if (!env.USE_GOOGLE_CLOUD) return;
     const required = [
       ["GOOGLE_CLOUD_PROJECT", env.GOOGLE_CLOUD_PROJECT],
@@ -79,6 +97,10 @@ const EnvSchema = z
       }
     }
   });
+
+export function isGoogleSpeechModelLocationSupported(model: string, location: string): boolean {
+  return model !== "chirp_3" || CHIRP_3_GA_LOCATIONS.has(location);
+}
 
 export type AppConfig = Readonly<{
   nodeEnv: "development" | "test" | "production";
@@ -174,7 +196,7 @@ export function testConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     adminAccessCode: "admin-code-test-value",
     useGoogleCloud: false,
     googleCloudLocation: "global",
-    googleSpeechLocation: "global",
+    googleSpeechLocation: "us",
     googleSpeechRecognizer: "_",
     googleSpeechModel: "chirp_3",
     geminiModel: "gemini-3.6-flash",
