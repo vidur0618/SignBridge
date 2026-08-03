@@ -146,7 +146,8 @@ All product routes are same-origin. Site/admin routes use a short-lived HttpOnly
 | --- | --- |
 | `POST /api/session/exchange` | Exchange a site/admin access code for a cookie session |
 | `GET /api/avatar/config` | Return no-store experimental avatar configuration after site authentication; returns no token when disabled |
-| `POST /api/avatar/authorize` | Require explicit staff confirmation and run the deterministic avatar gate before releasing text to the browser SDK |
+| `POST /api/avatar/drafts` | Safety-gate and normalize a finalized message into a session-bound, five-minute server draft without contacting the provider |
+| `POST /api/avatar/drafts/:draftId/decision` | Consume the canonical draft once as `play` or `fallback`; the decision request cannot replace its text |
 | `POST /api/avatar/events` | Record structured start/completion/failure evidence without transcript text |
 | `WS /api/live-transcription` | Receive PCM and emit partial, final, reviewed candidate, fallback, error, and speech-end events |
 | `POST /api/audio/transcribe` | Validate/transcribe WAV, MP3, or WebM up to 10 MB and 60 seconds |
