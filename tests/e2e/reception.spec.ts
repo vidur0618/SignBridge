@@ -745,6 +745,7 @@ test("avatar mode requires activation and per-message confirmation before provid
   expect(authorizationBodies).toHaveLength(0);
   expect(sdk.requestCount()).toBe(1);
 
+  await page.getByLabel("Message for the visitor").fill(message);
   await page.getByRole("button", { name: "Prepare avatar & caption" }).click();
   await page.getByRole("button", { name: "Confirm avatar message" }).click();
 
@@ -827,6 +828,17 @@ test("captions-only typed text does not run the reception intent classifier", as
   await expect(page.getByText("The final caption is ready. No phrase classifier or signing provider was invoked.")).toBeVisible();
   await expect(page.getByText(/outside the ten reception phrases/i)).toHaveCount(0);
   await expect(page.locator(".final-caption p")).toHaveText("The quarterly board packet is on the printer.");
+});
+
+test("sign-out clears typed visitor text before the next session", async ({ page }) => {
+  await openDemo(page);
+  await page.getByRole("button", { name: "Type English message" }).click();
+  await page.getByLabel("Message for the visitor").fill("Private visitor message");
+  await page.getByRole("button", { name: "Sign out" }).click();
+
+  await page.getByRole("button", { name: "Explore local demo" }).click();
+  await page.getByRole("button", { name: "Type English message" }).click();
+  await expect(page.getByLabel("Message for the visitor")).toHaveValue("");
 });
 
 test("switching to captions only withdraws an already displayed approval choice", async ({ page }) => {

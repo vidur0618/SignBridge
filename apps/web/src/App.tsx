@@ -210,6 +210,7 @@ export function App(): ReactNode {
     setFallbackReason("");
     setNotice("");
     setError("");
+    setTypedMessage("");
     setProcessState("idle");
     setShowFeedback(false);
     setFeedbackSent(false);
