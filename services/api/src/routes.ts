@@ -11,6 +11,7 @@ import {
   AudioTranscriptionQuerySchema,
   AudioTranscriptionResponseSchema,
   CatalogPublicResponseSchema,
+  CURRENT_CONSENT_VERSION,
   DecisionRequestSchema,
   DecisionResponseSchema,
   FeedbackRequestSchema,
@@ -88,6 +89,9 @@ export async function registerRoutes(app: FastifyInstance, dependencies: AppDepe
       const parsed = AccessCodeExchangeRequestSchema.safeParse(request.body);
       if (!parsed.success) {
         return reply.code(400).send({ error: "invalid_session_request" });
+      }
+      if (parsed.data.consentVersion !== CURRENT_CONSENT_VERSION) {
+        return reply.code(409).send({ error: "consent_version_outdated" });
       }
       const role = resolveRole(parsed.data.accessCode, config);
       if (!role) return reply.code(401).send({ error: "invalid_access_code" });

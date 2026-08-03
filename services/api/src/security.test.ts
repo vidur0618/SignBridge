@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { CURRENT_CONSENT_VERSION } from "@signbridge/contracts";
 import { authenticate, makeTestApp } from "./test-helpers.js";
 
 const apps: Array<Awaited<ReturnType<typeof makeTestApp>>["app"]> = [];
@@ -23,7 +24,7 @@ describe("session and same-origin security", () => {
       headers: { origin: "http://127.0.0.1:4173" },
       payload: {
         accessCode: "site-code-test",
-        consentVersion: "2026-08-01.1",
+        consentVersion: CURRENT_CONSENT_VERSION,
       },
     });
     expect(login.statusCode).toBe(200);
@@ -32,6 +33,26 @@ describe("session and same-origin security", () => {
     expect(login.headers["permissions-policy"]).toContain("microphone=(self)");
     expect(login.headers["permissions-policy"]).toContain("payment=()");
     expect(login.json()).not.toHaveProperty("role");
+  });
+
+  it("rejects a stale or client-invented consent version before creating a session", async () => {
+    const { app, events } = await makeTestApp();
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/session/exchange",
+      headers: { origin: "http://127.0.0.1:4173" },
+      payload: {
+        accessCode: "site-code-test",
+        consentVersion: "v2026-08-01-stale",
+      },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error: "consent_version_outdated" });
+    expect(response.headers["set-cookie"]).toBeUndefined();
+    expect(events.events).toEqual([]);
   });
 
   it("rejects a mismatched browser origin and separates admin capability", async () => {

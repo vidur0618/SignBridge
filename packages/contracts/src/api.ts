@@ -23,6 +23,8 @@ import {
   UnsupportedReasonCodeSchema,
 } from "./intents.js";
 
+export const CURRENT_CONSENT_VERSION = "v2026-08-02-avatar" as const;
+
 export const AccessCodeExchangeRequestSchema = z
   .object({
     accessCode: z.string().min(8).max(128),

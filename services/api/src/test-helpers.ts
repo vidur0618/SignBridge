@@ -1,4 +1,5 @@
 import {
+  CURRENT_CONSENT_VERSION,
   CatalogSchema,
   RECEPTION_INTENTS,
   REQUIRED_RIGHTS_USES,
@@ -205,7 +206,7 @@ export async function authenticate(
     headers: { origin: "http://127.0.0.1:4173" },
     payload: {
       accessCode,
-      consentVersion: "2026-08-01.1",
+      consentVersion: CURRENT_CONSENT_VERSION,
     },
   });
   const setCookie = response.headers["set-cookie"];

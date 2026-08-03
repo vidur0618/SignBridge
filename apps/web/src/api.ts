@@ -8,6 +8,7 @@ import {
   CatalogPublicResponseSchema,
   DecisionResponseSchema,
   FeedbackResponseSchema,
+  CURRENT_CONSENT_VERSION,
   type AccessCodeExchangeRequest,
   type AvatarAuthorizationResponse,
   type AvatarExecutionEventRequest,
@@ -38,7 +39,7 @@ export class ApiError extends Error {
   }
 }
 
-export const CURRENT_CONSENT_VERSION = "v2026-08-02-avatar";
+export { CURRENT_CONSENT_VERSION };
 
 export interface SessionInfo {
   sessionId: string;

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { CURRENT_CONSENT_VERSION } from "@signbridge/contracts";
 import type { ExperienceMode, LiveServerEvent } from "@signbridge/contracts";
 import type { LiveSpeechCallbacks, SpeechProvider } from "./adapters/speech.js";
 import { authenticate, makeTestApp, supportedClassifier } from "./test-helpers.js";
@@ -73,7 +74,7 @@ describe("live transcription with the Hand Talk provider configured", () => {
       sessionId: login.sessionId,
       siteId: "test-site",
       locale: "en-US",
-      consentVersion: "2026-08-01.1",
+      consentVersion: CURRENT_CONSENT_VERSION,
       outputLane: "asl_captions",
       audio: { encoding: "LINEAR16", sampleRateHertz: 16_000, channelCount: 1 },
       retention: "none",
@@ -198,7 +199,7 @@ async function runLiveSession(
     sessionId: login.sessionId,
     siteId: "test-site",
     locale: "en-US",
-    consentVersion: "2026-08-01.1",
+    consentVersion: CURRENT_CONSENT_VERSION,
     outputLane,
     audio: { encoding: "LINEAR16", sampleRateHertz: 16_000, channelCount: 1 },
     retention: "none",
