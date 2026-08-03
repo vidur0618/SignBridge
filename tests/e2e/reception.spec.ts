@@ -669,10 +669,20 @@ test("production playback failure preserves the finalized English caption", asyn
 
 test("captions-only default never fetches avatar configuration or SDK code", async ({ page }) => {
   let configRequests = 0;
-  let authorizationRequests = 0;
+  let draftRequests = 0;
+  let decisionRequests = 0;
+  let legacyAuthorizationRequests = 0;
   const sdk = await installMockHandTalkSdk(page);
+  await page.route("**/api/avatar/drafts", async (route) => {
+    draftRequests += 1;
+    await route.fulfill({ status: 500, json: { code: "unexpected_avatar_request", message: "Unexpected test request." } });
+  });
+  await page.route("**/api/avatar/drafts/*/decision", async (route) => {
+    decisionRequests += 1;
+    await route.fulfill({ status: 500, json: { code: "unexpected_avatar_request", message: "Unexpected test request." } });
+  });
   await page.route("**/api/avatar/authorize", async (route) => {
-    authorizationRequests += 1;
+    legacyAuthorizationRequests += 1;
     await route.fulfill({ status: 500, json: { code: "unexpected_avatar_request", message: "Unexpected test request." } });
   });
   await openMockedProduction(page, {
@@ -687,25 +697,49 @@ test("captions-only default never fetches avatar configuration or SDK code", asy
 
   await expect(page.locator(".final-caption p")).toHaveText("Please wait here.");
   expect(configRequests).toBe(0);
-  expect(authorizationRequests).toBe(0);
+  expect(draftRequests).toBe(0);
+  expect(decisionRequests).toBe(0);
+  expect(legacyAuthorizationRequests).toBe(0);
   expect(sdk.requestCount()).toBe(0);
 });
 
 test("avatar mode requires activation and per-message confirmation before provider translation", async ({ page }) => {
   let configRequests = 0;
-  const authorizationBodies: unknown[] = [];
+  let legacyAuthorizationRequests = 0;
+  const draftBodies: unknown[] = [];
+  const decisionBodies: Array<{ draftId: string; decision: string }> = [];
   const executionBodies: Array<{ authorizationId: string; result: string; latencyMs?: number }> = [];
   const sdk = await installMockHandTalkSdk(page);
-  await page.route("**/api/avatar/authorize", async (route) => {
-    authorizationBodies.push(route.request().postDataJSON());
+  await page.route("**/api/avatar/drafts", async (route) => {
+    draftBodies.push(route.request().postDataJSON());
+    const draftId = `avatar-draft-test-${draftBodies.length}`;
     await route.fulfill({
       json: {
-        allowed: true,
-        authorizationId: "avatar-auth-test-1",
-        provider: "handtalk",
+        accepted: true,
+        draftId,
         text: "The blue umbrella is waiting beside the chair.",
+        expiresAt: "2026-08-02T22:00:00.000Z",
       },
     });
+  });
+  await page.route("**/api/avatar/drafts/*/decision", async (route) => {
+    const draftId = new URL(route.request().url()).pathname.split("/").at(-2) ?? "";
+    const body = route.request().postDataJSON() as { decision: "play" | "fallback" };
+    decisionBodies.push({ draftId, decision: body.decision });
+    await route.fulfill({
+      json: body.decision === "play"
+        ? {
+            allowed: true,
+            authorizationId: "avatar-auth-test-2",
+            provider: "handtalk",
+            text: "The blue umbrella is waiting beside the chair.",
+          }
+        : { allowed: false, reasonCode: "staff_rejected" },
+    });
+  });
+  await page.route("**/api/avatar/authorize", async (route) => {
+    legacyAuthorizationRequests += 1;
+    await route.fulfill({ status: 500, json: { code: "legacy_route_called" } });
   });
   await page.route("**/api/avatar/events", async (route) => {
     executionBodies.push(route.request().postDataJSON() as { authorizationId: string; result: string; latencyMs?: number });
@@ -737,12 +771,20 @@ test("avatar mode requires activation and per-message confirmation before provid
 
   await expect(page.getByRole("heading", { name: "Send this caption to the experimental avatar?" })).toBeVisible();
   await expect(page.locator(".video-caption p")).toHaveText(message);
-  expect(authorizationBodies).toHaveLength(0);
+  expect(draftBodies).toEqual([{
+    text: message,
+    locale: "en-US",
+    source: "type",
+  }]);
+  expect(decisionBodies).toHaveLength(0);
+  expect(legacyAuthorizationRequests).toBe(0);
   expect(sdk.requestCount()).toBe(1);
 
   await page.getByRole("button", { name: "Keep captions only" }).click();
+  await expect(page.getByRole("heading", { name: "Continue another way" })).toBeVisible();
   await expect(page.locator(".video-caption p")).toHaveText(message);
-  expect(authorizationBodies).toHaveLength(0);
+  expect(decisionBodies).toEqual([{ draftId: "avatar-draft-test-1", decision: "fallback" }]);
+  expect(legacyAuthorizationRequests).toBe(0);
   expect(sdk.requestCount()).toBe(1);
 
   await page.getByLabel("Message for the visitor").fill(message);
@@ -752,16 +794,19 @@ test("avatar mode requires activation and per-message confirmation before provid
   await expect.poll(() => page.evaluate(() => (
     window as unknown as { handTalkTranslateCalls?: string[] }
   ).handTalkTranslateCalls ?? [])).toEqual([message]);
-  expect(authorizationBodies).toEqual([{
-    text: message,
-    locale: "en-US",
-    source: "type",
-    staffConfirmed: true,
-  }]);
+  expect(draftBodies).toEqual([
+    { text: message, locale: "en-US", source: "type" },
+    { text: message, locale: "en-US", source: "type" },
+  ]);
+  expect(decisionBodies).toEqual([
+    { draftId: "avatar-draft-test-1", decision: "fallback" },
+    { draftId: "avatar-draft-test-2", decision: "play" },
+  ]);
+  expect(legacyAuthorizationRequests).toBe(0);
   expect(sdk.requestCount()).toBe(1);
   await expect.poll(() => executionBodies.map(({ result }) => result)).toEqual(["started", "completed"]);
   for (const event of executionBodies) {
-    expect(event.authorizationId).toBe("avatar-auth-test-1");
+    expect(event.authorizationId).toBe("avatar-auth-test-2");
     expect(event.latencyMs).toBeGreaterThanOrEqual(0);
     expect(event.latencyMs).toBeLessThanOrEqual(120_000);
   }
@@ -771,6 +816,42 @@ test("avatar mode requires activation and per-message confirmation before provid
   await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
   await expect(page.getByLabel("Avatar speed")).toHaveValue("normal");
   await expect(page.getByLabel("Avatar speed").locator("option")).toHaveText(["Slow", "Standard", "Fast"]);
+});
+
+test("a server-rejected avatar draft stays captions-only without provider translation", async ({ page }) => {
+  let legacyAuthorizationRequests = 0;
+  const draftBodies: unknown[] = [];
+  const sdk = await installMockHandTalkSdk(page);
+  await page.route("**/api/avatar/drafts", async (route) => {
+    draftBodies.push(route.request().postDataJSON());
+    await route.fulfill({ json: { accepted: false, reasonCode: "high_stakes_content" } });
+  });
+  await page.route("**/api/avatar/authorize", async (route) => {
+    legacyAuthorizationRequests += 1;
+    await route.fulfill({ status: 500, json: { code: "legacy_route_called" } });
+  });
+  await openMockedProduction(page, { avatarEnabled: true });
+
+  await page.getByRole("radio", { name: /Experimental avatar \+ captions/ }).check();
+  await page.getByRole("checkbox", { name: /The visitor chose the experimental avatar/i }).check();
+  await page.getByRole("button", { name: "Enable experimental avatar" }).click();
+  await expect(page.getByText("Experimental ASL avatar ready")).toBeVisible();
+
+  const message = "Take this medicine now.";
+  await page.getByRole("button", { name: "Type English message" }).click();
+  await page.getByLabel("Message for the visitor").fill(message);
+  await page.getByRole("button", { name: "Prepare avatar & caption" }).click();
+
+  await expect(page.getByRole("heading", { name: "Continue another way" })).toBeVisible();
+  await expect(page.getByText("Safety checks kept this message as captions only. The server draft did not contact Hand Talk.")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Send this caption to the experimental avatar?" })).toHaveCount(0);
+  await expect(page.locator(".video-caption p")).toHaveText(message);
+  expect(draftBodies).toEqual([{ text: message, locale: "en-US", source: "type" }]);
+  expect(legacyAuthorizationRequests).toBe(0);
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { handTalkTranslateCalls?: string[] }
+  ).handTalkTranslateCalls ?? [])).toEqual([]);
+  expect(sdk.requestCount()).toBe(1);
 });
 
 test("demo speech flow marks provisional text and blocks fake ASL playback", async ({ page }) => {

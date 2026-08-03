@@ -13,7 +13,8 @@ import { runAvatarSafetyGate } from "@signbridge/contracts";
 import {
   ApiError,
   CURRENT_CONSENT_VERSION,
-  authorizeAvatar,
+  createAvatarDraft,
+  decideAvatarDraft,
   endSession,
   exchangeSession,
   loadCatalog,
@@ -201,6 +202,10 @@ export function App(): ReactNode {
         "fallback",
       ).catch(() => undefined);
     }
+    const pendingAvatarDraft = pendingAvatarMessage;
+    if (pendingAvatarDraft && runtime === "live") {
+      void decideAvatarDraft(pendingAvatarDraft.draftId, "fallback").catch(() => undefined);
+    }
     avatarExecutionRef.current = null;
     cancelActiveWork();
     setProvisional("");
@@ -218,9 +223,10 @@ export function App(): ReactNode {
     setAvatarRequest(null);
     finalReceivedRef.current = false;
     finalTranscriptRef.current = "";
-  }, [cancelActiveWork, candidate, runtime]);
+  }, [cancelActiveWork, candidate, pendingAvatarMessage, runtime]);
 
-  const prepareAvatarMessage = useCallback((text: string, source: AvatarMessageSource) => {
+  const prepareAvatarMessage = useCallback(async (text: string, source: AvatarMessageSource): Promise<void> => {
+    const generation = workGenerationRef.current;
     const normalized = text.trim();
     if (!normalized) {
       setPendingAvatarMessage(null);
@@ -247,11 +253,44 @@ export function App(): ReactNode {
       setNotice("The experimental avatar is not configured. The English caption remains available.");
       return;
     }
+    if (runtime !== "live") {
+      setFallbackReason("avatar_unavailable");
+      setProcessState("fallback");
+      setNotice("Local demo boundary: no server draft or Hand Talk request was made. The English caption remains available.");
+      return;
+    }
     setFallbackReason("");
-    setPendingAvatarMessage({ id: crypto.randomUUID(), text: normalized, source });
-    setProcessState("avatar_confirmation");
-    setNotice("Review the final caption. Nothing is sent to Hand Talk until staff confirms this message.");
-  }, [avatarActivated, avatarConfig?.enabled, mode]);
+    setProcessState("classifying");
+    setNotice("Running server safety checks. Creating a draft does not contact Hand Talk.");
+    try {
+      const draft = await createAvatarDraft(normalized, source);
+      if (generation !== workGenerationRef.current) {
+        if (draft.accepted) {
+          void decideAvatarDraft(draft.draftId, "fallback").catch(() => undefined);
+        }
+        return;
+      }
+      if (!draft.accepted) {
+        setPendingAvatarMessage(null);
+        setFallbackReason(draft.reasonCode);
+        setProcessState("fallback");
+        setNotice("Safety checks kept this message as captions only. The server draft did not contact Hand Talk.");
+        return;
+      }
+      setFinalCaption(draft.text);
+      setPendingAvatarMessage({ draftId: draft.draftId, text: draft.text, source });
+      setProcessState("avatar_confirmation");
+      setNotice("Review the server-checked final caption. The draft did not contact Hand Talk; the next step asks staff whether to send it.");
+    } catch (draftError) {
+      if (generation !== workGenerationRef.current) return;
+      setPendingAvatarMessage(null);
+      setAvatarRequest(null);
+      setError(formatError(draftError));
+      setFallbackReason(draftError instanceof ApiError ? draftError.code ?? "avatar_error" : "avatar_error");
+      setProcessState("fallback");
+      setNotice("The server draft could not be prepared. Nothing was sent to Hand Talk; keep the English caption visible.");
+    }
+  }, [avatarActivated, avatarConfig?.enabled, mode, runtime]);
 
   const handleAvatarStateChange = useCallback((next: AvatarPlaybackState) => {
     setAvatarState(next);
@@ -337,7 +376,7 @@ export function App(): ReactNode {
       terminateLiveAttempt();
       if (!finalReceivedRef.current) return;
       if (mode === "avatar_captions") {
-        prepareAvatarMessage(finalTranscriptRef.current, "speech");
+        void prepareAvatarMessage(finalTranscriptRef.current, "speech");
       } else if (mode === "captions_only") {
         setFallbackReason("");
         setProcessState("caption_ready");
@@ -348,7 +387,7 @@ export function App(): ReactNode {
     if (event.type === "candidate" && event.candidate) {
       terminateLiveAttempt();
       if (mode === "avatar_captions" && finalReceivedRef.current) {
-        prepareAvatarMessage(finalTranscriptRef.current || event.text || "", "speech");
+        void prepareAvatarMessage(finalTranscriptRef.current || event.text || "", "speech");
         return;
       }
       if (mode === "captions_only") {
@@ -370,7 +409,7 @@ export function App(): ReactNode {
     if (event.type === "fallback") {
       terminateLiveAttempt();
       if (mode === "avatar_captions" && finalReceivedRef.current) {
-        prepareAvatarMessage(finalTranscriptRef.current, "speech");
+        void prepareAvatarMessage(finalTranscriptRef.current, "speech");
         return;
       }
       setFallbackReason(event.code ?? "unknown_intent");
@@ -575,7 +614,7 @@ export function App(): ReactNode {
       if (generation !== workGenerationRef.current) return;
       terminateLiveAttempt();
       if (mode === "avatar_captions" && finalTranscriptRef.current) {
-        prepareAvatarMessage(finalTranscriptRef.current, "speech");
+        void prepareAvatarMessage(finalTranscriptRef.current, "speech");
         return;
       }
       if (mode === "captions_only" && finalTranscriptRef.current) {
@@ -612,7 +651,7 @@ export function App(): ReactNode {
       setFinalCaption(DEMO_TRANSCRIPT);
       demoPartialTimerRef.current = window.setTimeout(() => {
         if (generation !== workGenerationRef.current) return;
-        if (mode === "avatar_captions") prepareAvatarMessage(DEMO_TRANSCRIPT, "speech");
+        if (mode === "avatar_captions") void prepareAvatarMessage(DEMO_TRANSCRIPT, "speech");
         else if (mode === "asl_captions") applyCandidate(classifyDemoTranscript(DEMO_TRANSCRIPT));
         else {
           setFallbackReason("");
@@ -652,7 +691,7 @@ export function App(): ReactNode {
       demoPartialTimerRef.current = window.setTimeout(() => {
         if (generation !== workGenerationRef.current) return;
         setFinalCaption("Please wait here.");
-        if (mode === "avatar_captions") prepareAvatarMessage("Please wait here.", "upload");
+        if (mode === "avatar_captions") void prepareAvatarMessage("Please wait here.", "upload");
         else if (mode === "asl_captions") applyCandidate(classifyDemoTranscript("Please wait here."));
         else {
           setFallbackReason("");
@@ -668,7 +707,7 @@ export function App(): ReactNode {
       if (generation !== workGenerationRef.current) return;
       setFinalCaption(result.transcript);
       if (mode === "avatar_captions") {
-        prepareAvatarMessage(result.transcript, "upload");
+        await prepareAvatarMessage(result.transcript, "upload");
       } else if (mode === "captions_only") {
         setFallbackReason("");
         setProcessState("caption_ready");
@@ -697,7 +736,7 @@ export function App(): ReactNode {
     resetUtterance();
     setFinalCaption(text);
     if (mode === "avatar_captions") {
-      prepareAvatarMessage(text, "type");
+      void prepareAvatarMessage(text, "type");
     } else if (mode === "captions_only") {
       const safety = runAvatarSafetyGate({ text, locale: "en-US", isFinal: true });
       setCandidate(null);
@@ -726,7 +765,7 @@ export function App(): ReactNode {
     if (!intent) return;
     resetUtterance();
     if (mode === "avatar_captions") {
-      prepareAvatarMessage(intent.caption, "phrase");
+      void prepareAvatarMessage(intent.caption, "phrase");
       return;
     }
     setFinalCaption(intent.caption);
@@ -757,6 +796,9 @@ export function App(): ReactNode {
     avatarExecutionRef.current = null;
     void avatarRef.current?.stop().catch(() => undefined);
     setAsset(null);
+    if (pendingAvatarMessage && runtime === "live") {
+      void decideAvatarDraft(pendingAvatarMessage.draftId, "fallback").catch(() => undefined);
+    }
     setPendingAvatarMessage(null);
     setAvatarRequest(null);
     if (candidate && runtime === "live") {
@@ -823,30 +865,30 @@ export function App(): ReactNode {
   async function decideAvatar(confirm: boolean): Promise<void> {
     const pending = pendingAvatarMessage;
     if (!pending) return;
-    if (!confirm) {
-      setPendingAvatarMessage(null);
-      setAvatarRequest(null);
-      setFallbackReason("staff_rejected");
-      setProcessState("fallback");
-      setNotice("Staff kept the English caption only. Nothing was sent to Hand Talk.");
-      return;
-    }
-
     const generation = workGenerationRef.current;
     setDeciding(true);
     setError("");
     try {
-      const authorization = await authorizeAvatar(pending.text, pending.source);
+      const decision = confirm ? "play" : "fallback";
+      const authorization = await decideAvatarDraft(pending.draftId, decision);
       if (generation !== workGenerationRef.current) return;
-      if (!authorization.allowed) {
-        setPendingAvatarMessage(null);
+      setPendingAvatarMessage(null);
+      if (!confirm) {
         setAvatarRequest(null);
+        avatarExecutionRef.current = null;
+        setFallbackReason("staff_rejected");
+        setProcessState("fallback");
+        setNotice("Staff kept the English caption only. The server draft was consumed and nothing was sent to Hand Talk.");
+        return;
+      }
+      if (!authorization.allowed) {
+        setAvatarRequest(null);
+        avatarExecutionRef.current = null;
         setFallbackReason(authorization.reasonCode);
         setProcessState("fallback");
         setNotice("Safety checks kept this message as captions only. Nothing was sent to Hand Talk.");
         return;
       }
-      setPendingAvatarMessage(null);
       setFallbackReason("");
       avatarExecutionRef.current = {
         authorizationId: authorization.authorizationId,

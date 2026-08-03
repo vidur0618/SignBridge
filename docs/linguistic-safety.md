@@ -45,7 +45,7 @@ No Hand Talk token or output has yet been tested. Until all blockers close, this
 
 - Provisional ASR text may be displayed but must never be sent for signing. Only an `isFinal` speech result may enter either signing lane.
 - Captions-only is the default. Typed text is explicit input and may enter the avatar only after the staff member selects avatar mode, submits it, and confirms that exact message.
-- `POST /api/avatar/authorize` blocks consequential, prompt-injection, name-bearing, number-heavy, partial, empty, unsupported-locale, and over-limit input before the browser may call the provider.
+- `POST /api/avatar/drafts` blocks consequential, prompt-injection, name-bearing, number-heavy, partial, empty, unsupported-locale, and over-limit input. A separate single-use `POST /api/avatar/drafts/:draftId/decision` request must consume the server-owned canonical draft before the browser may call the provider.
 - Captions-only mode sends no text to Hand Talk.
 - Provider initialization, authentication, WebGL, timeout, translation, or playback failure leaves the finalized caption visible.
 - Names, numbers, acronyms, unconstrained directions, and ambiguous text are not presumed to be signed correctly by the avatar.

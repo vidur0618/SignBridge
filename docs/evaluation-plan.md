@@ -43,7 +43,7 @@ The avatar lane cannot inherit the ten-phrase review. Before any customer pilot,
 Technical/provider gates:
 
 - verify the official 1.0.0 script loads only from the pinned HTTPS URL on current Chrome and Edge with WebGL;
-- prove that captions-only is the default, configuration/token retrieval is deferred until explicit session activation, and only staff-confirmed final or explicitly submitted text that passes `POST /api/avatar/authorize` leaves the browser;
+- prove that captions-only is the default, configuration/token retrieval is deferred until explicit session activation, draft creation never contacts the provider, and only a single-use `play` decision for a server-owned draft releases its canonical text to the browser SDK;
 - prove 100% fallback recall for the avatar consequential, prompt-injection, name, and number cases in the frozen negative set, with no SDK load or provider call;
 - reconcile each provider start/completion/failure with its signed authorization ID and transcript-free event record;
 - record provider request success/failure, first-motion latency, completion, pause, resume, repeat, stop, speed, reload, token expiry, quota, offline, and revocation behavior;

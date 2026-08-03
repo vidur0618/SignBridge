@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { HttpsUrlSchema, IdentifierSchema } from "./common.js";
+import { HttpsUrlSchema, IdentifierSchema, IsoTimestampSchema } from "./common.js";
 import { UnsupportedReasonCodeSchema } from "./intents.js";
 
 export const HandTalkAvatarSchema = z.enum(["HUGO", "MAYA"]);
@@ -30,15 +30,37 @@ export type AvatarRuntimeConfigResponse = z.infer<typeof AvatarRuntimeConfigResp
 export const AvatarMessageSourceSchema = z.enum(["speech", "upload", "type", "phrase"]);
 export type AvatarMessageSource = z.infer<typeof AvatarMessageSourceSchema>;
 
-export const AvatarAuthorizationRequestSchema = z
+export const AvatarDraftCreateRequestSchema = z
   .object({
     text: z.string().min(1).max(1_000),
     locale: z.literal("en-US"),
     source: AvatarMessageSourceSchema,
-    staffConfirmed: z.literal(true),
   })
   .strict();
-export type AvatarAuthorizationRequest = z.infer<typeof AvatarAuthorizationRequestSchema>;
+export type AvatarDraftCreateRequest = z.infer<typeof AvatarDraftCreateRequestSchema>;
+
+export const AvatarDraftCreateResponseSchema = z.discriminatedUnion("accepted", [
+  z
+    .object({
+      accepted: z.literal(true),
+      draftId: IdentifierSchema,
+      text: z.string().min(1).max(1_000),
+      expiresAt: IsoTimestampSchema,
+    })
+    .strict(),
+  z
+    .object({
+      accepted: z.literal(false),
+      reasonCode: UnsupportedReasonCodeSchema,
+    })
+    .strict(),
+]);
+export type AvatarDraftCreateResponse = z.infer<typeof AvatarDraftCreateResponseSchema>;
+
+export const AvatarDraftDecisionRequestSchema = z
+  .object({ decision: z.enum(["play", "fallback"]) })
+  .strict();
+export type AvatarDraftDecisionRequest = z.infer<typeof AvatarDraftDecisionRequestSchema>;
 
 export const AvatarAuthorizationResponseSchema = z.discriminatedUnion("allowed", [
   z

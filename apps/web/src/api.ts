@@ -2,6 +2,7 @@ import {
   AccessCodeExchangeResponseSchema,
   AdminMetricsResponseSchema,
   AvatarAuthorizationResponseSchema,
+  AvatarDraftCreateResponseSchema,
   AvatarExecutionEventResponseSchema,
   AvatarRuntimeConfigResponseSchema,
   AudioTranscriptionResponseSchema,
@@ -11,6 +12,7 @@ import {
   CURRENT_CONSENT_VERSION,
   type AccessCodeExchangeRequest,
   type AvatarAuthorizationResponse,
+  type AvatarDraftCreateResponse,
   type AvatarExecutionEventRequest,
   type AvatarMessageSource,
   type DecisionRequest,
@@ -73,6 +75,8 @@ function publicErrorMessage(code: string | undefined): string {
   if (code === "unsupported_audio_type") return "Choose a WAV, MP3, or WebM audio file.";
   if (code === "audio_too_large") return "Choose an audio file smaller than 10 MB.";
   if (code === "rate_limited") return "This pilot is busy. Wait briefly or use typing.";
+  if (code === "avatar_unavailable") return "The experimental avatar is not configured. Keep the English caption visible.";
+  if (code === "avatar_draft_not_available") return "This avatar draft expired or was already used. Prepare the caption again.";
   return "The request could not be completed. Use captions or typing to continue.";
 }
 
@@ -123,21 +127,36 @@ export async function loadAvatarConfig(): Promise<AvatarRuntimeConfig> {
   );
 }
 
-export async function authorizeAvatar(
+export async function createAvatarDraft(
   text: string,
   source: AvatarMessageSource,
-): Promise<AvatarAuthorizationResponse> {
+): Promise<AvatarDraftCreateResponse> {
   return parseContract(
-    AvatarAuthorizationResponseSchema.safeParse(await requestJson("/api/avatar/authorize", {
+    AvatarDraftCreateResponseSchema.safeParse(await requestJson("/api/avatar/drafts", {
       method: "POST",
       body: JSON.stringify({
         text,
         locale: "en-US",
         source,
-        staffConfirmed: true,
       }),
     })),
-    "avatar authorization",
+    "avatar draft",
+  );
+}
+
+export async function decideAvatarDraft(
+  draftId: string,
+  decision: "play" | "fallback",
+): Promise<AvatarAuthorizationResponse> {
+  return parseContract(
+    AvatarAuthorizationResponseSchema.safeParse(await requestJson(
+      `/api/avatar/drafts/${encodeURIComponent(draftId)}/decision`,
+      {
+        method: "POST",
+        body: JSON.stringify({ decision }),
+      },
+    )),
+    "avatar draft decision",
   );
 }
 

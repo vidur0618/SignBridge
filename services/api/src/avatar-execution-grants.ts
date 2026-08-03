@@ -1,6 +1,8 @@
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import type { AvatarMessageSource } from "@signbridge/contracts";
 
 const AUTHORIZATION_TTL_MS = 5 * 60_000;
+const DRAFT_TTL_MS = 5 * 60_000;
 const REQUEST_ID_PATTERN = /^[a-f0-9]{32}$/;
 const EXPIRY_PATTERN = /^[0-9a-z]{1,8}$/;
 const DIGEST_PATTERN = /^[A-Za-z0-9_-]{43}$/;
@@ -17,6 +19,14 @@ interface AvatarExecutionGrant extends AvatarAuthorizationClaims {
   authorizationId: string;
   sessionId: string;
   state: "authorized" | "started";
+}
+
+export interface AvatarDraft {
+  draftId: string;
+  sessionId: string;
+  normalizedText: string;
+  source: AvatarMessageSource;
+  expiresAtMs: number;
 }
 
 interface CreateAuthorizationOptions {
@@ -102,11 +112,40 @@ export function verifyAvatarAuthorizationId(
  */
 export class MemoryAvatarExecutionGrantStore {
   readonly #grants = new Map<string, AvatarExecutionGrant>();
+  readonly #drafts = new Map<string, AvatarDraft>();
   readonly #secret: string;
   #expiryTimer: NodeJS.Timeout | null = null;
 
   constructor(secret: string) {
     this.#secret = secret;
+  }
+
+  createDraft(
+    sessionId: string,
+    normalizedText: string,
+    source: AvatarMessageSource,
+    nowMs = Date.now(),
+  ): AvatarDraft {
+    this.#cleanupExpired(nowMs);
+    const draft: AvatarDraft = {
+      draftId: randomUUID(),
+      sessionId,
+      normalizedText,
+      source,
+      expiresAtMs: nowMs + DRAFT_TTL_MS,
+    };
+    this.#drafts.set(draft.draftId, draft);
+    this.#scheduleExpiryCleanup(nowMs);
+    return { ...draft };
+  }
+
+  consumeDraft(draftId: string, sessionId: string, nowMs = Date.now()): AvatarDraft | null {
+    this.#cleanupExpired(nowMs);
+    const draft = this.#drafts.get(draftId);
+    if (!draft || draft.sessionId !== sessionId || draft.expiresAtMs <= nowMs) return null;
+    this.#drafts.delete(draftId);
+    this.#scheduleExpiryCleanup(nowMs);
+    return { ...draft };
   }
 
   issue(sessionId: string, normalizedText: string, nowMs = Date.now()): string {
@@ -171,11 +210,15 @@ export class MemoryAvatarExecutionGrantStore {
     if (this.#expiryTimer) clearTimeout(this.#expiryTimer);
     this.#expiryTimer = null;
     this.#grants.clear();
+    this.#drafts.clear();
   }
 
   #cleanupExpired(nowMs: number): void {
     for (const [authorizationId, grant] of this.#grants) {
       if (grant.expiresAtMs <= nowMs) this.#grants.delete(authorizationId);
+    }
+    for (const [draftId, draft] of this.#drafts) {
+      if (draft.expiresAtMs <= nowMs) this.#drafts.delete(draftId);
     }
   }
 
@@ -185,6 +228,9 @@ export class MemoryAvatarExecutionGrantStore {
     let earliestExpiry = Number.POSITIVE_INFINITY;
     for (const grant of this.#grants.values()) {
       earliestExpiry = Math.min(earliestExpiry, grant.expiresAtMs);
+    }
+    for (const draft of this.#drafts.values()) {
+      earliestExpiry = Math.min(earliestExpiry, draft.expiresAtMs);
     }
     if (!Number.isFinite(earliestExpiry)) return;
     this.#expiryTimer = setTimeout(() => {

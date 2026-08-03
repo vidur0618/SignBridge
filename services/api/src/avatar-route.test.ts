@@ -1,8 +1,10 @@
-import { afterEach, describe, expect, it } from "vitest";
 import {
   AvatarAuthorizationResponseSchema,
+  AvatarDraftCreateResponseSchema,
   AvatarExecutionEventResponseSchema,
+  type AvatarMessageSource,
 } from "@signbridge/contracts";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   MemoryAvatarExecutionGrantStore,
@@ -10,32 +12,27 @@ import {
 } from "./avatar-execution-grants.js";
 import { authenticate, makeTestApp } from "./test-helpers.js";
 
-const apps: Array<Awaited<ReturnType<typeof makeTestApp>>["app"]> = [];
-afterEach(async () => Promise.all(apps.splice(0).map((app) => app.close())));
+type TestApp = Awaited<ReturnType<typeof makeTestApp>>["app"];
 
-describe("experimental avatar authorization", () => {
-  it("requires a configured provider", async () => {
+const apps: TestApp[] = [];
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await Promise.all(apps.splice(0).map((app) => app.close()));
+});
+
+describe("server-owned experimental avatar drafts", () => {
+  it("requires a configured provider before accepting transcript text", async () => {
     const { app } = await makeTestApp();
     apps.push(app);
     const session = await authenticate(app);
 
-    const response = await app.inject({
-      method: "POST",
-      url: "/api/avatar/authorize",
-      headers: { cookie: session.cookie },
-      payload: {
-        text: "The meeting moved to Tuesday afternoon",
-        locale: "en-US",
-        source: "type",
-        staffConfirmed: true,
-      },
-    });
+    const response = await createDraftResponse(app, session.cookie);
 
     expect(response.statusCode).toBe(503);
     expect(response.json()).toEqual({ error: "avatar_unavailable" });
   });
 
-  it("binds a route-issued authorization to the exact normalized text without exposing it", async () => {
+  it("creates a normalized, five-minute, session-bound draft and removes the old route", async () => {
     const { app, dependencies, events } = await makeTestApp({
       config: { handtalkToken: "test-token" },
     });
@@ -43,71 +40,205 @@ describe("experimental avatar authorization", () => {
     const session = await authenticate(app);
     const rawText = "  The meeting   moved to Tuesday afternoon  ";
     const normalizedText = "The meeting moved to Tuesday afternoon";
+    const startedAt = Date.now();
 
-    const response = await app.inject({
-      method: "POST",
-      url: "/api/avatar/authorize",
-      headers: { cookie: session.cookie },
-      payload: { text: rawText, locale: "en-US", source: "type", staffConfirmed: true },
-    });
+    const response = await createDraftResponse(app, session.cookie, rawText);
 
     expect(response.statusCode).toBe(200);
-    const authorization = AvatarAuthorizationResponseSchema.parse(response.json());
+    const draft = AvatarDraftCreateResponseSchema.parse(response.json());
+    expect(draft).toMatchObject({
+      accepted: true,
+      draftId: expect.stringMatching(/^[a-f0-9-]{36}$/),
+      text: normalizedText,
+    });
+    if (!draft.accepted) throw new Error("expected avatar draft");
+    expect(Date.parse(draft.expiresAt)).toBeGreaterThanOrEqual(startedAt + 5 * 60_000);
+    expect(Date.parse(draft.expiresAt)).toBeLessThanOrEqual(Date.now() + 5 * 60_000);
+
+    const decision = await decideDraft(app, session.cookie, draft.draftId, "play");
+    expect(decision.statusCode).toBe(200);
+    const authorization = AvatarAuthorizationResponseSchema.parse(decision.json());
     expect(authorization).toMatchObject({
       allowed: true,
       provider: "handtalk",
       text: normalizedText,
     });
     if (!authorization.allowed) throw new Error("expected avatar authorization");
-    expect(authorization.authorizationId.length).toBeLessThanOrEqual(128);
-    const idParts = authorization.authorizationId.split(".");
-    expect(idParts).toEqual([
-      expect.stringMatching(/^[a-f0-9]{32}$/),
-      expect.stringMatching(/^[0-9a-z]{6,8}$/),
-      expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
-      expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
-    ]);
     expect(verifyAvatarAuthorizationId(
       authorization.authorizationId,
       session.sessionId,
       dependencies.config.sessionSecret,
       { normalizedText },
-    )).toMatchObject({
-      requestId: expect.stringMatching(/^[a-f0-9]{32}$/),
-      textHash: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
-    });
-    expect(verifyAvatarAuthorizationId(
-      authorization.authorizationId,
-      session.sessionId,
-      dependencies.config.sessionSecret,
-      { normalizedText: `${normalizedText}.` },
-    )).toBeNull();
-    expect(verifyAvatarAuthorizationId(
-      authorization.authorizationId,
-      "another-session",
-      dependencies.config.sessionSecret,
-      { normalizedText },
-    )).toBeNull();
-    const requestId = idParts[0];
-    if (!requestId) throw new Error("expected request ID");
-    const changedFirstCharacter = requestId.startsWith("a") ? "b" : "a";
-    const tamperedRequestId = `${changedFirstCharacter}${requestId.slice(1)}`;
-    expect(verifyAvatarAuthorizationId(
-      [tamperedRequestId, ...idParts.slice(1)].join("."),
-      session.sessionId,
-      dependencies.config.sessionSecret,
-      { normalizedText },
-    )).toBeNull();
+    )).not.toBeNull();
+    expect(JSON.stringify(events.events)).not.toContain(rawText);
     expect(JSON.stringify(events.events)).not.toContain(normalizedText);
+
+    const removedRoute = await app.inject({
+      method: "POST",
+      url: "/api/avatar/authorize",
+      headers: { cookie: session.cookie },
+      payload: {
+        text: normalizedText,
+        locale: "en-US",
+        source: "type",
+        staffConfirmed: true,
+      },
+    });
+    expect(removedRoute.statusCode).toBe(404);
   });
 
+  it.each([
+    ["Please call an ambulance", "high_stakes_content"],
+    ["My name is Alexandra Smith", "name_or_number_heavy"],
+  ])("rejects unsafe draft text before a staff decision: %s", async (text, reasonCode) => {
+    const { app, events } = await makeTestApp({ config: { handtalkToken: "test-token" } });
+    apps.push(app);
+    const session = await authenticate(app);
+
+    const response = await createDraftResponse(app, session.cookie, text, "speech");
+
+    expect(response.statusCode).toBe(200);
+    expect(AvatarDraftCreateResponseSchema.parse(response.json())).toEqual({
+      accepted: false,
+      reasonCode,
+    });
+    expect(events.events).toContainEqual(expect.objectContaining({
+      type: "fallback",
+      flow: "live",
+      fallbackReason: reasonCode,
+    }));
+    expect(events.events.some((event) => event.type === "staff_decision")).toBe(false);
+    expect(events.events.some((event) => event.type === "avatar_authorized")).toBe(false);
+    expect(JSON.stringify(events.events)).not.toContain(text);
+  });
+
+  it("does not let another authenticated session consume a draft", async () => {
+    const { app } = await makeTestApp({ config: { handtalkToken: "test-token" } });
+    apps.push(app);
+    const owner = await authenticate(app);
+    const otherSession = await authenticate(app);
+    const draft = await createDraft(app, owner.cookie);
+
+    const foreignDecision = await decideDraft(app, otherSession.cookie, draft.draftId, "play");
+    expect(foreignDecision.statusCode).toBe(409);
+    expect(foreignDecision.json()).toEqual({ error: "avatar_draft_not_available" });
+
+    const ownerDecision = await decideDraft(app, owner.cookie, draft.draftId, "play");
+    expect(ownerDecision.statusCode).toBe(200);
+    expect(AvatarAuthorizationResponseSchema.parse(ownerDecision.json())).toMatchObject({
+      allowed: true,
+    });
+  });
+
+  it("consumes a played draft exactly once", async () => {
+    const { app, events } = await makeTestApp({ config: { handtalkToken: "test-token" } });
+    apps.push(app);
+    const session = await authenticate(app);
+    const draft = await createDraft(app, session.cookie);
+
+    const first = await decideDraft(app, session.cookie, draft.draftId, "play");
+    const replay = await decideDraft(app, session.cookie, draft.draftId, "fallback");
+
+    expect(first.statusCode).toBe(200);
+    expect(replay.statusCode).toBe(409);
+    expect(replay.json()).toEqual({ error: "avatar_draft_not_available" });
+    expect(events.events.filter((event) => event.type === "staff_decision")).toHaveLength(1);
+    expect(events.events.filter((event) => event.type === "avatar_authorized")).toHaveLength(1);
+  });
+
+  it("consumes a fallback decision without issuing an execution grant", async () => {
+    const { app, events } = await makeTestApp({ config: { handtalkToken: "test-token" } });
+    apps.push(app);
+    const session = await authenticate(app);
+    const draft = await createDraft(app, session.cookie, "Please wait in the lobby", "phrase");
+
+    const fallback = await decideDraft(app, session.cookie, draft.draftId, "fallback");
+    const replay = await decideDraft(app, session.cookie, draft.draftId, "play");
+
+    expect(fallback.statusCode).toBe(200);
+    expect(AvatarAuthorizationResponseSchema.parse(fallback.json())).toEqual({
+      allowed: false,
+      reasonCode: "staff_rejected",
+    });
+    expect(replay.statusCode).toBe(409);
+    expect(events.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "staff_decision",
+        flow: "manual",
+        staffDecision: "fallback",
+      }),
+      expect.objectContaining({
+        type: "fallback",
+        flow: "manual",
+        fallbackReason: "staff_rejected",
+      }),
+    ]));
+    expect(events.events.some((event) => event.type === "avatar_authorized")).toBe(false);
+  });
+
+  it.each(["forged!draft", "00000000-0000-4000-8000-000000000000"])(
+    "returns the same unavailable response for a forged or unknown draft ID: %s",
+    async (draftId) => {
+      const { app } = await makeTestApp({ config: { handtalkToken: "test-token" } });
+      apps.push(app);
+      const session = await authenticate(app);
+
+      const response = await decideDraft(app, session.cookie, draftId, "play");
+
+      expect(response.statusCode).toBe(409);
+      expect(response.json()).toEqual({ error: "avatar_draft_not_available" });
+    },
+  );
+
+  it("rejects an expired draft without authorizing provider execution", async () => {
+    const nowMs = Date.now();
+    const now = vi.spyOn(Date, "now").mockReturnValue(nowMs);
+    const { app, events } = await makeTestApp({ config: { handtalkToken: "test-token" } });
+    apps.push(app);
+    const session = await authenticate(app);
+    const draft = await createDraft(app, session.cookie);
+    now.mockReturnValue(nowMs + 5 * 60_000);
+
+    const response = await decideDraft(app, session.cookie, draft.draftId, "play");
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error: "avatar_draft_not_available" });
+    expect(events.events.some((event) => event.type === "avatar_authorized")).toBe(false);
+  });
+
+  it("does not consume a draft when the decision payload is invalid", async () => {
+    const { app } = await makeTestApp({ config: { handtalkToken: "test-token" } });
+    apps.push(app);
+    const session = await authenticate(app);
+    const draft = await createDraft(app, session.cookie);
+
+    const invalid = await app.inject({
+      method: "POST",
+      url: `/api/avatar/drafts/${encodeURIComponent(draft.draftId)}/decision`,
+      headers: { cookie: session.cookie },
+      payload: { decision: "approve" },
+    });
+    const valid = await decideDraft(app, session.cookie, draft.draftId, "play");
+
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.json()).toEqual({ error: "invalid_avatar_decision" });
+    expect(valid.statusCode).toBe(200);
+  });
+});
+
+describe("avatar execution lifecycle", () => {
   it("accepts one started event followed by one completed event", async () => {
     const { app, events } = await makeTestApp({ config: { handtalkToken: "test-token" } });
     apps.push(app);
     const session = await authenticate(app);
     const authorization = await authorizeAvatar(app, session.cookie);
 
-    const started = await recordAvatarEvent(app, session.cookie, authorization.authorizationId, "started");
+    const started = await recordAvatarEvent(
+      app,
+      session.cookie,
+      authorization.authorizationId,
+      "started",
+    );
     const completed = await recordAvatarEvent(
       app,
       session.cookie,
@@ -153,175 +284,143 @@ describe("experimental avatar authorization", () => {
       "failed",
       25,
     );
+
     expect(failed.statusCode).toBe(202);
     expect(events.events.filter((event) => event.type === "avatar_execution")).toEqual([
       expect.objectContaining({ avatarResult: "failed", avatarLatencyMs: 25 }),
     ]);
   });
 
-  it("rejects duplicate started events and records only the accepted transition", async () => {
+  it("rejects duplicate started events and completed-before-started without corrupting state", async () => {
     const { app, events } = await makeTestApp({ config: { handtalkToken: "test-token" } });
     apps.push(app);
     const session = await authenticate(app);
     const authorization = await authorizeAvatar(app, session.cookie);
 
-    const first = await recordAvatarEvent(app, session.cookie, authorization.authorizationId, "started");
-    const duplicate = await recordAvatarEvent(app, session.cookie, authorization.authorizationId, "started");
-    expect(first.statusCode).toBe(202);
-    expect(duplicate.statusCode).toBe(409);
-    expect(duplicate.json()).toEqual({ error: "avatar_event_not_authorized" });
-    expect(events.events.filter((event) => event.type === "avatar_execution")).toEqual([
-      expect.objectContaining({ avatarResult: "started" }),
-    ]);
-  });
-
-  it("rejects completed before started without consuming the grant", async () => {
-    const { app, events } = await makeTestApp({ config: { handtalkToken: "test-token" } });
-    apps.push(app);
-    const session = await authenticate(app);
-    const authorization = await authorizeAvatar(app, session.cookie);
-
+    const prematureCompleted = await recordAvatarEvent(
+      app,
+      session.cookie,
+      authorization.authorizationId,
+      "completed",
+    );
+    const started = await recordAvatarEvent(
+      app,
+      session.cookie,
+      authorization.authorizationId,
+      "started",
+    );
+    const duplicateStarted = await recordAvatarEvent(
+      app,
+      session.cookie,
+      authorization.authorizationId,
+      "started",
+    );
     const completed = await recordAvatarEvent(
       app,
       session.cookie,
       authorization.authorizationId,
       "completed",
     );
-    const started = await recordAvatarEvent(app, session.cookie, authorization.authorizationId, "started");
-    expect(completed.statusCode).toBe(409);
-    expect(started.statusCode).toBe(202);
-    expect(events.events.filter((event) => event.type === "avatar_execution")).toEqual([
-      expect.objectContaining({ avatarResult: "started" }),
-    ]);
-  });
-
-  it("rejects terminal replay after a completed lifecycle", async () => {
-    const { app, events } = await makeTestApp({ config: { handtalkToken: "test-token" } });
-    apps.push(app);
-    const session = await authenticate(app);
-    const authorization = await authorizeAvatar(app, session.cookie);
-
-    expect((await recordAvatarEvent(
-      app,
-      session.cookie,
-      authorization.authorizationId,
-      "started",
-    )).statusCode).toBe(202);
-    expect((await recordAvatarEvent(
-      app,
-      session.cookie,
-      authorization.authorizationId,
-      "completed",
-    )).statusCode).toBe(202);
-    expect((await recordAvatarEvent(
+    const terminalReplay = await recordAvatarEvent(
       app,
       session.cookie,
       authorization.authorizationId,
       "failed",
-    )).statusCode).toBe(409);
-    expect(events.events.filter((event) => event.type === "avatar_execution").map((event) => event.avatarResult))
-      .toEqual(["started", "completed"]);
+    );
+
+    expect(prematureCompleted.statusCode).toBe(409);
+    expect(started.statusCode).toBe(202);
+    expect(duplicateStarted.statusCode).toBe(409);
+    expect(completed.statusCode).toBe(202);
+    expect(terminalReplay.statusCode).toBe(409);
+    expect(events.events
+      .filter((event) => event.type === "avatar_execution")
+      .map((event) => event.avatarResult)).toEqual(["started", "completed"]);
   });
 
-  it("rejects expired grants", async () => {
+  it("rejects execution telemetry from another session", async () => {
+    const { app } = await makeTestApp({ config: { handtalkToken: "test-token" } });
+    apps.push(app);
+    const owner = await authenticate(app);
+    const otherSession = await authenticate(app);
+    const authorization = await authorizeAvatar(app, owner.cookie);
+
+    const response = await recordAvatarEvent(
+      app,
+      otherSession.cookie,
+      authorization.authorizationId,
+      "started",
+    );
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error: "avatar_event_not_authorized" });
+  });
+
+  it("rejects expired execution grants", () => {
     const nowMs = Date.now();
-    const grants = new MemoryAvatarExecutionGrantStore("test-session-secret-that-is-long-enough");
+    const grants = new MemoryAvatarExecutionGrantStore(
+      "test-session-secret-that-is-long-enough",
+    );
     const authorizationId = grants.issue(
       "session-test",
       "The meeting moved to Tuesday afternoon",
       nowMs,
     );
 
-    expect(grants.acceptEvent(authorizationId, "session-test", "started", nowMs + 5 * 60_000))
-      .toBe(false);
+    expect(grants.acceptEvent(
+      authorizationId,
+      "session-test",
+      "started",
+      nowMs + 5 * 60_000,
+    )).toBe(false);
     grants.dispose();
-  });
-
-  it.each([
-    ["Please call an ambulance", "high_stakes_content"],
-    ["My name is Alexandra Smith", "name_or_number_heavy"],
-  ])("rejects %s before the provider request", async (text, reasonCode) => {
-    const { app, events } = await makeTestApp({ config: { handtalkToken: "test-token" } });
-    apps.push(app);
-    const session = await authenticate(app);
-
-    const response = await app.inject({
-      method: "POST",
-      url: "/api/avatar/authorize",
-      headers: { cookie: session.cookie },
-      payload: { text, locale: "en-US", source: "speech", staffConfirmed: true },
-    });
-
-    expect(response.statusCode).toBe(200);
-    expect(AvatarAuthorizationResponseSchema.parse(response.json())).toEqual({
-      allowed: false,
-      reasonCode,
-    });
-    expect(events.events).toContainEqual(expect.objectContaining({
-      type: "fallback",
-      flow: "live",
-      fallbackReason: reasonCode,
-    }));
-    expect(events.events.some((event) => event.type === "avatar_authorized")).toBe(false);
-    expect(JSON.stringify(events.events)).not.toContain(text);
-  });
-
-  it("rejects a request without explicit staff confirmation", async () => {
-    const { app } = await makeTestApp({ config: { handtalkToken: "test-token" } });
-    apps.push(app);
-    const session = await authenticate(app);
-
-    const response = await app.inject({
-      method: "POST",
-      url: "/api/avatar/authorize",
-      headers: { cookie: session.cookie },
-      payload: {
-        text: "Please wait in the lobby",
-        locale: "en-US",
-        source: "type",
-        staffConfirmed: false,
-      },
-    });
-
-    expect(response.statusCode).toBe(400);
-    expect(response.json()).toEqual({ error: "invalid_avatar_authorization" });
-  });
-
-  it("rejects execution telemetry that was not authorized for the session", async () => {
-    const { app } = await makeTestApp({ config: { handtalkToken: "test-token" } });
-    apps.push(app);
-    const session = await authenticate(app);
-
-    const response = await app.inject({
-      method: "POST",
-      url: "/api/avatar/events",
-      headers: { cookie: session.cookie },
-      payload: {
-        authorizationId: "untrusted-authorization-id",
-        result: "started",
-      },
-    });
-
-    expect(response.statusCode).toBe(409);
-    expect(response.json()).toEqual({ error: "avatar_event_not_authorized" });
   });
 });
 
-async function authorizeAvatar(
-  app: Awaited<ReturnType<typeof makeTestApp>>["app"],
+async function createDraftResponse(
+  app: TestApp,
   cookie: string,
+  text = "The meeting moved to Tuesday afternoon",
+  source: AvatarMessageSource = "type",
 ) {
-  const response = await app.inject({
+  return app.inject({
     method: "POST",
-    url: "/api/avatar/authorize",
+    url: "/api/avatar/drafts",
     headers: { cookie },
-    payload: {
-      text: "The meeting moved to Tuesday afternoon",
-      locale: "en-US",
-      source: "type",
-      staffConfirmed: true,
-    },
+    payload: { text, locale: "en-US", source },
   });
+}
+
+async function createDraft(
+  app: TestApp,
+  cookie: string,
+  text = "The meeting moved to Tuesday afternoon",
+  source: AvatarMessageSource = "type",
+) {
+  const response = await createDraftResponse(app, cookie, text, source);
+  expect(response.statusCode).toBe(200);
+  const draft = AvatarDraftCreateResponseSchema.parse(response.json());
+  if (!draft.accepted) throw new Error("expected avatar draft");
+  return draft;
+}
+
+function decideDraft(
+  app: TestApp,
+  cookie: string,
+  draftId: string,
+  decision: "play" | "fallback",
+) {
+  return app.inject({
+    method: "POST",
+    url: `/api/avatar/drafts/${encodeURIComponent(draftId)}/decision`,
+    headers: { cookie },
+    payload: { decision },
+  });
+}
+
+async function authorizeAvatar(app: TestApp, cookie: string) {
+  const draft = await createDraft(app, cookie);
+  const response = await decideDraft(app, cookie, draft.draftId, "play");
   expect(response.statusCode).toBe(200);
   const authorization = AvatarAuthorizationResponseSchema.parse(response.json());
   if (!authorization.allowed) throw new Error("expected avatar authorization");
@@ -329,7 +428,7 @@ async function authorizeAvatar(
 }
 
 function recordAvatarEvent(
-  app: Awaited<ReturnType<typeof makeTestApp>>["app"],
+  app: TestApp,
   cookie: string,
   authorizationId: string,
   result: "started" | "completed" | "failed",

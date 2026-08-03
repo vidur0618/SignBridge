@@ -44,7 +44,9 @@ export interface AvatarTranslationRequest {
   text: string;
 }
 
-export interface PendingAvatarMessage extends AvatarTranslationRequest {
+export interface PendingAvatarMessage {
+  draftId: string;
+  text: string;
   source: AvatarMessageSource;
 }
 

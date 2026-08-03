@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { loadAvatarConfig, normalizeLiveEvent, transcribeAudio } from "./api.js";
+import {
+  createAvatarDraft,
+  decideAvatarDraft,
+  loadAvatarConfig,
+  normalizeLiveEvent,
+  transcribeAudio,
+} from "./api.js";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -50,6 +56,75 @@ describe("avatar runtime configuration", () => {
       status: 502,
       code: "invalid_contract",
     });
+  });
+});
+
+describe("server-owned avatar drafts", () => {
+  it("creates a draft without claiming staff confirmation or contacting the legacy route", async () => {
+    const payload = {
+      accepted: true,
+      draftId: "avatar-draft-1",
+      text: "Please wait here.",
+      expiresAt: "2026-08-02T21:05:00.000Z",
+    };
+    const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>): Promise<Response> => new Response(
+      JSON.stringify(payload),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(createAvatarDraft("  Please wait here.  ", "type")).resolves.toEqual(payload);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/avatar/drafts",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "same-origin",
+        body: JSON.stringify({
+          text: "  Please wait here.  ",
+          locale: "en-US",
+          source: "type",
+        }),
+      }),
+    );
+    expect(fetchMock.mock.calls[0]?.[0]).not.toBe("/api/avatar/authorize");
+  });
+
+  it("preserves a server safety rejection as captions-only data", async () => {
+    const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>): Promise<Response> => new Response(
+      JSON.stringify({ accepted: false, reasonCode: "high_stakes_content" }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(createAvatarDraft("Take this medicine now.", "speech")).resolves.toEqual({
+      accepted: false,
+      reasonCode: "high_stakes_content",
+    });
+  });
+
+  it("consumes a server draft through an encoded play decision", async () => {
+    const payload = {
+      allowed: true,
+      authorizationId: "avatar-auth-1",
+      provider: "handtalk",
+      text: "Please wait here.",
+    };
+    const fetchMock = vi.fn(async (..._args: Parameters<typeof fetch>): Promise<Response> => new Response(
+      JSON.stringify(payload),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(decideAvatarDraft("draft/with?reserved", "play")).resolves.toEqual(payload);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/avatar/drafts/draft%2Fwith%3Freserved/decision",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "same-origin",
+        body: JSON.stringify({ decision: "play" }),
+      }),
+    );
   });
 });
 

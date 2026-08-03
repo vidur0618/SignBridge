@@ -3,8 +3,10 @@ import {
   AccessCodeExchangeRequestSchema,
   AccessCodeExchangeResponseSchema,
   AdminMetricsResponseSchema,
-  AvatarAuthorizationRequestSchema,
   AvatarAuthorizationResponseSchema,
+  AvatarDraftCreateRequestSchema,
+  AvatarDraftCreateResponseSchema,
+  AvatarDraftDecisionRequestSchema,
   AvatarExecutionEventRequestSchema,
   AvatarExecutionEventResponseSchema,
   AvatarRuntimeConfigResponseSchema,
@@ -16,6 +18,7 @@ import {
   DecisionResponseSchema,
   FeedbackRequestSchema,
   FeedbackResponseSchema,
+  IdentifierSchema,
   RECEPTION_INTENTS,
   UNSUPPORTED_REASON_CODES,
   createRenderSegment,
@@ -159,12 +162,12 @@ export async function registerRoutes(app: FastifyInstance, dependencies: AppDepe
     );
   });
 
-  app.post("/api/avatar/authorize", { preHandler: requireSite }, async (request, reply) => {
+  app.post("/api/avatar/drafts", { preHandler: requireSite }, async (request, reply) => {
     const auth = request.authSession;
     if (!auth) return reply.code(401).send({ error: "authentication_required" });
     if (!config.handtalkToken) return reply.code(503).send({ error: "avatar_unavailable" });
-    const parsed = AvatarAuthorizationRequestSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ error: "invalid_avatar_authorization" });
+    const parsed = AvatarDraftCreateRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid_avatar_draft" });
 
     const gate = runAvatarSafetyGate({
       text: parsed.data.text,
@@ -181,32 +184,99 @@ export async function registerRoutes(app: FastifyInstance, dependencies: AppDepe
         type: "fallback",
         flow,
         fallbackReason: gate.reasonCode,
-        staffDecision: "fallback",
+        consentVersion: auth.consentVersion,
       });
-      return AvatarAuthorizationResponseSchema.parse(gate);
+      return AvatarDraftCreateResponseSchema.parse({
+        accepted: false,
+        reasonCode: gate.reasonCode,
+      });
     }
 
-    const authorizationId = avatarExecutionGrants.issue(auth.sessionId, gate.normalizedText);
-    await events.record({
-      eventId: randomUUID(),
-      occurredAt: new Date().toISOString(),
-      siteId: auth.siteId,
-      sessionId: auth.sessionId,
-      type: "avatar_authorized",
-      flow,
-      staffDecision: "play",
-      consentVersion: auth.consentVersion,
-      avatarProvider: "handtalk",
-      avatarName: config.handtalkAvatar,
-      avatarAuthorizationId: authorizationId,
-    });
-    return AvatarAuthorizationResponseSchema.parse({
-      allowed: true,
-      authorizationId,
-      provider: "handtalk",
-      text: gate.normalizedText,
+    const draft = avatarExecutionGrants.createDraft(
+      auth.sessionId,
+      gate.normalizedText,
+      parsed.data.source,
+    );
+    return AvatarDraftCreateResponseSchema.parse({
+      accepted: true,
+      draftId: draft.draftId,
+      text: draft.normalizedText,
+      expiresAt: new Date(draft.expiresAtMs).toISOString(),
     });
   });
+
+  app.post(
+    "/api/avatar/drafts/:draftId/decision",
+    { preHandler: requireSite },
+    async (request, reply) => {
+      const auth = request.authSession;
+      if (!auth) return reply.code(401).send({ error: "authentication_required" });
+      if (!config.handtalkToken) return reply.code(503).send({ error: "avatar_unavailable" });
+      const parsed = AvatarDraftDecisionRequestSchema.safeParse(request.body);
+      if (!parsed.success) return reply.code(400).send({ error: "invalid_avatar_decision" });
+      const parsedDraftId = IdentifierSchema.safeParse(
+        (request.params as { draftId?: unknown }).draftId,
+      );
+      if (!parsedDraftId.success) {
+        return reply.code(409).send({ error: "avatar_draft_not_available" });
+      }
+      const draft = avatarExecutionGrants.consumeDraft(parsedDraftId.data, auth.sessionId);
+      if (!draft) return reply.code(409).send({ error: "avatar_draft_not_available" });
+      const flow = avatarFlow(draft.source);
+
+      await events.record({
+        eventId: randomUUID(),
+        occurredAt: new Date().toISOString(),
+        siteId: auth.siteId,
+        sessionId: auth.sessionId,
+        type: "staff_decision",
+        flow,
+        staffDecision: parsed.data.decision,
+        consentVersion: auth.consentVersion,
+      });
+
+      if (parsed.data.decision === "fallback") {
+        await events.record({
+          eventId: randomUUID(),
+          occurredAt: new Date().toISOString(),
+          siteId: auth.siteId,
+          sessionId: auth.sessionId,
+          type: "fallback",
+          flow,
+          fallbackReason: "staff_rejected",
+          consentVersion: auth.consentVersion,
+        });
+        return AvatarAuthorizationResponseSchema.parse({
+          allowed: false,
+          reasonCode: "staff_rejected",
+        });
+      }
+
+      const authorizationId = avatarExecutionGrants.issue(
+        auth.sessionId,
+        draft.normalizedText,
+      );
+      await events.record({
+        eventId: randomUUID(),
+        occurredAt: new Date().toISOString(),
+        siteId: auth.siteId,
+        sessionId: auth.sessionId,
+        type: "avatar_authorized",
+        flow,
+        staffDecision: "play",
+        consentVersion: auth.consentVersion,
+        avatarProvider: "handtalk",
+        avatarName: config.handtalkAvatar,
+        avatarAuthorizationId: authorizationId,
+      });
+      return AvatarAuthorizationResponseSchema.parse({
+        allowed: true,
+        authorizationId,
+        provider: "handtalk",
+        text: draft.normalizedText,
+      });
+    },
+  );
 
   app.post("/api/avatar/events", { preHandler: requireSite }, async (request, reply) => {
     const auth = request.authSession;
