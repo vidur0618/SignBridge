@@ -15,7 +15,12 @@ import type {
 
 const HANDTALK_SCRIPT_ATTRIBUTE = "data-signbridge-handtalk-sdk";
 const HANDTALK_HOST_ID = "signbridge-handtalk-avatar";
+const SDK_LOAD_TIMEOUT_MS = 15_000;
 const READY_TIMEOUT_MS = 15_000;
+const TRANSLATE_TIMEOUT_MS = 20_000;
+const PLAYBACK_START_TIMEOUT_MS = 10_000;
+const PLAYBACK_COMPLETION_TIMEOUT_MS = 120_000;
+const STOP_TIMEOUT_MS = 3_000;
 
 type HandTalkApplicationState = string | Record<string, unknown>;
 
@@ -55,42 +60,135 @@ export interface HandTalkAvatarHandle {
   changeSpeed(speed: "normal" | "slow" | "fast"): void;
 }
 
+export interface AvatarExecutionEvent {
+  requestId: string;
+  result: "started" | "completed" | "failed" | "canceled";
+}
+
 interface HandTalkAvatarProps {
   config: AvatarRuntimeConfig | null;
   request: AvatarTranslationRequest | null;
   caption: string;
   onStateChange?: (state: AvatarPlaybackState) => void;
   onError?: (message: string) => void;
+  onExecutionEvent?: (event: AvatarExecutionEvent) => void;
 }
 
-let sdkLoadPromise: Promise<void> | null = null;
+interface SdkLoadState {
+  url: string;
+  promise: Promise<void>;
+}
+
+interface AvatarOperationTicket {
+  readonly signal: AbortSignal;
+  isCurrent(): boolean;
+  commit(effect: () => void): boolean;
+}
+
+interface AvatarOperationCoordinator {
+  begin(): AvatarOperationTicket;
+  cancel(): void;
+  complete(ticket: AvatarOperationTicket): void;
+  hasCurrent(): boolean;
+}
+
+export class AvatarOperationCancelledError extends Error {
+  constructor() {
+    super("The avatar operation was cancelled.");
+    this.name = "AvatarOperationCancelledError";
+  }
+}
+
+export class AvatarOperationTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AvatarOperationTimeoutError";
+  }
+}
+
+let sdkLoadState: SdkLoadState | null = null;
 let loadedSdkUrl: string | null = null;
 
 export const HandTalkAvatar = forwardRef<HandTalkAvatarHandle, HandTalkAvatarProps>(
   function HandTalkAvatar(props, ref): ReactNode {
     const apiRef = useRef<HandTalkApi | null>(null);
     const initializeRef = useRef<Promise<void> | null>(null);
+    const configurationControllerRef = useRef<AbortController | null>(null);
     const unsubscribeRef = useRef<(() => void) | null>(null);
     const lastRequestIdRef = useRef<string | null>(null);
-    const queueGenerationRef = useRef(0);
-    const translationChainRef = useRef<Promise<void>>(Promise.resolve());
+    const activeExecutionRef = useRef<{
+      requestId: string;
+      ticket: AvatarOperationTicket;
+      started: boolean;
+      terminal: boolean;
+    } | null>(null);
+    const operationCoordinatorRef = useRef<AvatarOperationCoordinator>(
+      createAvatarOperationCoordinator(),
+    );
+    const providerPoisonedRef = useRef(false);
+    const configEpochRef = useRef(0);
     const mountedRef = useRef(true);
     const [state, setState] = useState<AvatarPlaybackState>(
       props.config?.enabled ? "loading" : "unavailable",
     );
 
-    const updateState = (next: AvatarPlaybackState): void => {
-      if (!mountedRef.current) return;
+    const updateState = (
+      next: AvatarPlaybackState,
+      epoch = configEpochRef.current,
+    ): void => {
+      if (!mountedRef.current || epoch !== configEpochRef.current) return;
       setState(next);
       props.onStateChange?.(next);
     };
 
-    const reportError = (message: string): void => {
-      updateState("error");
+    const reportError = (
+      message: string,
+      epoch = configEpochRef.current,
+    ): void => {
+      if (!mountedRef.current || epoch !== configEpochRef.current) return;
+      updateState("error", epoch);
       props.onError?.(message);
     };
 
-    async function translateNow(text: string, generation: number): Promise<void> {
+    const emitExecution = (
+      execution: NonNullable<typeof activeExecutionRef.current>,
+      result: AvatarExecutionEvent["result"],
+    ): void => {
+      if (!mountedRef.current || execution.terminal) return;
+      if (result === "started") {
+        if (execution.started) return;
+        execution.started = true;
+      } else {
+        execution.terminal = true;
+      }
+      props.onExecutionEvent?.({ requestId: execution.requestId, result });
+    };
+
+    const poisonProvider = (api: HandTalkApi): void => {
+      if (providerPoisonedRef.current) return;
+      providerPoisonedRef.current = true;
+      unsubscribeRef.current?.();
+      unsubscribeRef.current = null;
+      if (apiRef.current === api) apiRef.current = null;
+      initializeRef.current = null;
+      configurationControllerRef.current?.abort();
+      configurationControllerRef.current = null;
+      const host = document.getElementById(HANDTALK_HOST_ID);
+      host?.replaceChildren();
+      host?.removeAttribute("id");
+      updateState("error");
+      void withAvatarOperationTimeout(
+        Promise.resolve().then(() => api.disable()),
+        STOP_TIMEOUT_MS,
+        "The avatar provider could not be disabled in time.",
+      ).catch(() => undefined);
+    };
+
+    async function translateNow(
+      text: string,
+      ticket: AvatarOperationTicket,
+      onProviderStart: () => void,
+    ): Promise<void> {
       const normalized = text.trim();
       const config = props.config;
       if (!config?.enabled || !config.token || !config.sdkUrl) {
@@ -101,39 +199,123 @@ export const HandTalkAvatar = forwardRef<HandTalkAvatarHandle, HandTalkAvatarPro
         throw new Error(`Keep each avatar message under ${config.maxCharacters} characters.`);
       }
 
-      await initializeRef.current;
-      if (generation !== queueGenerationRef.current) return;
+      await awaitWithAvatarCancellation(initializeRef.current, ticket.signal);
+      throwIfAvatarOperationCancelled(ticket.signal);
       const api = apiRef.current;
       if (!api) throw new Error("The ASL avatar could not be initialized.");
 
       let current = normalizedApplicationState(api.getApplicationState());
-      if (current === "translating") current = await waitForApplicationState(api, ["ready", "minimized"]);
-      if (generation !== queueGenerationRef.current) return;
+      if (current === "translating" || current === "paused") {
+        current = await waitForApplicationState(api, ["ready", "minimized"], {
+          signal: ticket.signal,
+        });
+      }
+      throwIfAvatarOperationCancelled(ticket.signal);
       if (current === "minimized") {
         api.maximize();
-        await waitForApplicationState(api, ["ready"]);
+        await waitForApplicationState(api, ["ready"], { signal: ticket.signal });
       } else if (current !== "ready") {
-        await waitForApplicationState(api, ["ready"]);
+        await waitForApplicationState(api, ["ready"], { signal: ticket.signal });
       }
 
-      await api.translate(normalized);
-      await waitForApplicationState(api, ["ready", "minimized"]);
-      if (generation === queueGenerationRef.current) updateState("ready");
+      const stepController = new AbortController();
+      const cancelStep = (): void => stepController.abort();
+      ticket.signal.addEventListener("abort", cancelStep, { once: true });
+      let invocationStarted = false;
+      const started = waitForApplicationState(api, ["translating"], {
+        timeoutMs: PLAYBACK_START_TIMEOUT_MS,
+        timeoutMessage: "The avatar did not start the message in time. Try again or use captions.",
+        acceptCurrent: false,
+        eventGate: () => invocationStarted,
+        signal: stepController.signal,
+      }).then(() => {
+        ticket.commit(onProviderStart);
+      });
+
+      try {
+        const accepted = withAvatarOperationTimeout(
+          Promise.resolve().then(() => {
+            invocationStarted = true;
+            return api.translate(normalized);
+          }),
+          TRANSLATE_TIMEOUT_MS,
+          "The avatar provider did not accept the message within 20 seconds. Try again or use captions.",
+          stepController.signal,
+        );
+        await Promise.all([accepted, started]);
+        await waitForApplicationState(api, ["ready", "minimized"], {
+          timeoutMs: PLAYBACK_COMPLETION_TIMEOUT_MS,
+          timeoutMessage: "The avatar did not finish the message within two minutes. Keep the caption visible and try again.",
+          signal: ticket.signal,
+        });
+      } catch (error: unknown) {
+        stepController.abort();
+        await started.catch(() => undefined);
+        if (error instanceof AvatarOperationTimeoutError) {
+          poisonProvider(api);
+        } else if (!(error instanceof AvatarOperationCancelledError)) {
+          try {
+            await stopProviderMotion(api, ticket.signal);
+          } catch {
+            poisonProvider(api);
+          }
+        }
+        throw error;
+      } finally {
+        ticket.signal.removeEventListener("abort", cancelStep);
+      }
     }
 
-    function translate(text: string): Promise<void> {
+    async function translate(text: string, requestId?: string): Promise<void> {
+      if (providerPoisonedRef.current) {
+        throw new Error("The avatar provider was stopped after a timeout. Switch modes and reactivate it before trying again.");
+      }
       const config = props.config;
       const chunks = splitAvatarText(text, config?.maxCharacters ?? 1_000);
       if (chunks.length === 0) {
-        return Promise.reject(new Error("Enter or speak a message before starting the avatar."));
+        throw new Error("Enter or speak a message before starting the avatar.");
       }
-      const generation = queueGenerationRef.current;
-      for (const chunk of chunks) {
-        translationChainRef.current = translationChainRef.current
-          .catch(() => undefined)
-          .then(() => translateNow(chunk, generation));
+
+      const coordinator = operationCoordinatorRef.current;
+      const api = apiRef.current;
+      const shouldStopPrior = coordinator.hasCurrent()
+        || (api ? isActiveApplicationState(api.getApplicationState()) : false);
+      const priorExecution = activeExecutionRef.current;
+      const ticket = coordinator.begin();
+      if (priorExecution && !priorExecution.terminal) emitExecution(priorExecution, "canceled");
+      const execution = requestId
+        ? { requestId, ticket, started: false, terminal: false }
+        : null;
+      activeExecutionRef.current = execution;
+
+      try {
+        if (shouldStopPrior && api) {
+          try {
+            await stopProviderMotion(api, ticket.signal);
+          } catch (error: unknown) {
+            poisonProvider(api);
+            throw error;
+          }
+        }
+        for (const chunk of chunks) {
+          await translateNow(chunk, ticket, () => {
+            if (execution) emitExecution(execution, "started");
+          });
+        }
+        ticket.commit(() => {
+          updateState("ready");
+          if (execution) emitExecution(execution, "completed");
+        });
+      } catch (error: unknown) {
+        if (!ticket.isCurrent() || ticket.signal.aborted) {
+          throw new AvatarOperationCancelledError();
+        }
+        if (execution) emitExecution(execution, "failed");
+        throw error;
+      } finally {
+        coordinator.complete(ticket);
+        if (activeExecutionRef.current?.ticket === ticket) activeExecutionRef.current = null;
       }
-      return translationChainRef.current;
     }
 
     useImperativeHandle(ref, () => ({
@@ -147,17 +329,41 @@ export const HandTalkAvatar = forwardRef<HandTalkAvatarHandle, HandTalkAvatarPro
         updateState("translating");
       },
       repeat: async () => {
+        if (providerPoisonedRef.current) {
+          throw new Error("The avatar provider must be reactivated before replaying a message.");
+        }
         const api = apiRef.current;
         if (!api) throw new Error("The ASL avatar is not ready.");
-        await api.repeat();
+        try {
+          await withAvatarOperationTimeout(
+            Promise.resolve().then(() => api.repeat()),
+            TRANSLATE_TIMEOUT_MS,
+            "The avatar did not repeat the message in time. Use captions or try again.",
+            configurationControllerRef.current?.signal,
+          );
+        } catch (error: unknown) {
+          if (error instanceof AvatarOperationTimeoutError) poisonProvider(api);
+          throw error;
+        }
       },
       stop: async () => {
-        queueGenerationRef.current += 1;
-        translationChainRef.current = Promise.resolve();
+        const coordinator = operationCoordinatorRef.current;
+        const hadActiveOperation = coordinator.hasCurrent();
+        const execution = activeExecutionRef.current;
+        coordinator.cancel();
+        if (execution && !execution.terminal) emitExecution(execution, "canceled");
+        activeExecutionRef.current = null;
         const api = apiRef.current;
         if (!api) return;
         const current = normalizedApplicationState(api.getApplicationState());
-        if (current === "translating") await api.stop();
+        if (hadActiveOperation || current === "translating" || current === "paused") {
+          try {
+            await stopProviderMotion(api, configurationControllerRef.current?.signal);
+          } catch (error: unknown) {
+            poisonProvider(api);
+            throw error;
+          }
+        }
         updateState("ready");
       },
       changeSpeed: (speed) => apiRef.current?.changeAnimationSpeed(speed),
@@ -166,22 +372,33 @@ export const HandTalkAvatar = forwardRef<HandTalkAvatarHandle, HandTalkAvatarPro
     useEffect(() => {
       mountedRef.current = true;
       let disposed = false;
+      const epoch = configEpochRef.current + 1;
+      configEpochRef.current = epoch;
+      providerPoisonedRef.current = false;
       const config = props.config;
       if (!config?.enabled || !config.token || !config.sdkUrl) {
-        updateState("unavailable");
+        updateState("unavailable", epoch);
         initializeRef.current = null;
         return () => {
-          mountedRef.current = false;
+          if (configEpochRef.current === epoch) {
+            configEpochRef.current += 1;
+            mountedRef.current = false;
+          }
         };
       }
 
-      updateState("loading");
+      updateState("loading", epoch);
+      const initializationController = new AbortController();
+      configurationControllerRef.current = initializationController;
       const initialization = (async () => {
         if (!isPinnedHandTalkSdkUrl(config.sdkUrl ?? "")) {
           throw new Error("The configured Hand Talk SDK URL is not a pinned official release.");
         }
-        await loadHandTalkSdk(config.sdkUrl ?? "");
-        if (disposed) return;
+        await loadHandTalkSdk(config.sdkUrl ?? "", {
+          signal: initializationController.signal,
+        });
+        throwIfAvatarOperationCancelled(initializationController.signal);
+        if (disposed) throw new AvatarOperationCancelledError();
         if (!window.HTApi) throw new Error("The Hand Talk SDK did not expose its browser API.");
 
         const api = new window.HTApi({
@@ -192,12 +409,12 @@ export const HandTalkAvatar = forwardRef<HandTalkAvatarHandle, HandTalkAvatarPro
           parentElementSelector: `#${HANDTALK_HOST_ID}`,
           enableComponents: {
             caption: false,
-            changeSpeedButton: true,
+            changeSpeedButton: false,
             header: false,
-            pauseAnimationButton: true,
-            rateAnimationButton: true,
-            repeatAnimationButton: true,
-            stopAnimationButton: true,
+            pauseAnimationButton: false,
+            rateAnimationButton: false,
+            repeatAnimationButton: false,
+            stopAnimationButton: false,
             widget: false,
             zoom: true,
             rotate: false,
@@ -218,29 +435,48 @@ export const HandTalkAvatar = forwardRef<HandTalkAvatarHandle, HandTalkAvatarPro
         apiRef.current = api;
         unsubscribeRef.current = api.onApplicationStateChange((applicationState) => {
           const next = avatarStateFromApplicationState(applicationState);
-          if (next) updateState(next);
+          if (!next) return;
+          if (next === "ready" && operationCoordinatorRef.current.hasCurrent()) return;
+          updateState(next, epoch);
         });
         api.active();
-        await waitForApplicationState(api, ["ready"]);
-        updateState("ready");
+        await waitForApplicationState(api, ["ready"], {
+          signal: initializationController.signal,
+        });
+        updateState("ready", epoch);
       })();
       initializeRef.current = initialization;
       void initialization.catch((error: unknown) => {
-        reportError(publicAvatarError(error));
+        if (disposed || error instanceof AvatarOperationCancelledError) return;
+        const api = apiRef.current;
+        if (api) poisonProvider(api);
+        reportError(publicAvatarError(error), epoch);
       });
 
       return () => {
         disposed = true;
-        mountedRef.current = false;
-        queueGenerationRef.current += 1;
-        translationChainRef.current = Promise.resolve();
+        if (configEpochRef.current === epoch) {
+          configEpochRef.current += 1;
+          mountedRef.current = false;
+        }
+        initializationController.abort();
+        if (configurationControllerRef.current === initializationController) {
+          configurationControllerRef.current = null;
+        }
+        const coordinator = operationCoordinatorRef.current;
+        const hadActiveOperation = coordinator.hasCurrent();
+        coordinator.cancel();
+        activeExecutionRef.current = null;
         lastRequestIdRef.current = null;
         unsubscribeRef.current?.();
         unsubscribeRef.current = null;
         const api = apiRef.current;
         apiRef.current = null;
         initializeRef.current = null;
-        if (api) void api.disable().catch(() => undefined);
+        if (api) {
+          if (hadActiveOperation) void api.stop().catch(() => undefined);
+          void api.disable().catch(() => undefined);
+        }
       };
       // Configuration is immutable for one authenticated session.
       // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -250,12 +486,13 @@ export const HandTalkAvatar = forwardRef<HandTalkAvatarHandle, HandTalkAvatarPro
       const request = props.request;
       if (!request || request.id === lastRequestIdRef.current || !props.config?.enabled) return;
       lastRequestIdRef.current = request.id;
-      void translate(request.text).catch((error: unknown) => {
+      void translate(request.text, request.id).catch((error: unknown) => {
+        if (error instanceof AvatarOperationCancelledError) return;
         reportError(publicAvatarError(error));
       });
       // translate intentionally reads the latest provider instance and configuration.
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [props.request]);
+    }, [props.request, props.config?.enabled]);
 
     return (
       <div className={`handtalk-avatar state-${state}`}>
@@ -334,83 +571,303 @@ export function splitAvatarText(value: string, maxCharacters: number): string[] 
   return chunks;
 }
 
-function loadHandTalkSdk(url: string): Promise<void> {
+export function loadHandTalkSdk(
+  url: string,
+  options: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? SDK_LOAD_TIMEOUT_MS;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return Promise.reject(new RangeError("The SDK load timeout must be positive."));
+  }
+  if (options.signal?.aborted) return Promise.reject(new AvatarOperationCancelledError());
   if (window.HTApi && loadedSdkUrl === url) return Promise.resolve();
-  if (sdkLoadPromise && loadedSdkUrl === url) return sdkLoadPromise;
+  if (sdkLoadState) {
+    return sdkLoadState.url === url
+      ? awaitWithAvatarCancellation(sdkLoadState.promise, options.signal)
+      : Promise.reject(new Error("A different Hand Talk SDK release is already loading."));
+  }
   if (loadedSdkUrl && loadedSdkUrl !== url) {
     return Promise.reject(new Error("A different Hand Talk SDK release is already loaded."));
   }
 
-  loadedSdkUrl = url;
-  sdkLoadPromise = new Promise((resolve, reject) => {
-    const existing = document.querySelector<HTMLScriptElement>(`script[${HANDTALK_SCRIPT_ATTRIBUTE}]`);
-    if (existing) {
-      if (window.HTApi) {
-        resolve();
-        return;
-      }
-      existing.addEventListener("load", () => resolve(), { once: true });
-      existing.addEventListener("error", () => reject(new Error("The Hand Talk SDK could not be loaded.")), { once: true });
+  let resolvePromise = (): void => undefined;
+  let rejectPromise = (_error: Error): void => undefined;
+  const promise = new Promise<void>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  const loadState: SdkLoadState = { url, promise };
+  sdkLoadState = loadState;
+
+  const existing = document.querySelector<HTMLScriptElement>(`script[${HANDTALK_SCRIPT_ATTRIBUTE}]`);
+  if (existing && !window.HTApi) existing.remove();
+  const script = window.HTApi && existing ? existing : document.createElement("script");
+  let settled = false;
+  let timer: ReturnType<typeof globalThis.setTimeout> | undefined;
+
+  const cleanup = (): void => {
+    if (timer !== undefined) globalThis.clearTimeout(timer);
+    script.removeEventListener("load", handleLoad);
+    script.removeEventListener("error", handleError);
+    options.signal?.removeEventListener("abort", handleAbort);
+  };
+  const fail = (error: Error): void => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    if (sdkLoadState === loadState) sdkLoadState = null;
+    if (!window.HTApi) loadedSdkUrl = null;
+    script.remove();
+    rejectPromise(error);
+  };
+  const succeed = (): void => {
+    if (settled) return;
+    if (!window.HTApi) {
+      fail(new Error("The Hand Talk SDK loaded without exposing its browser API. Try again or use captions."));
       return;
     }
-    const script = document.createElement("script");
+    settled = true;
+    cleanup();
+    if (sdkLoadState === loadState) sdkLoadState = null;
+    loadedSdkUrl = url;
+    resolvePromise();
+  };
+  function handleLoad(): void {
+    succeed();
+  }
+  function handleError(): void {
+    fail(new Error("The Hand Talk SDK could not be loaded. Check the network, then try again or use captions."));
+  }
+  function handleAbort(): void {
+    fail(new AvatarOperationCancelledError());
+  }
+
+  script.addEventListener("load", handleLoad, { once: true });
+  script.addEventListener("error", handleError, { once: true });
+  options.signal?.addEventListener("abort", handleAbort, { once: true });
+  timer = globalThis.setTimeout(() => {
+    fail(new Error("The Hand Talk SDK did not load within 15 seconds. Check the network, then try again or use captions."));
+  }, timeoutMs);
+
+  if (window.HTApi) {
+    succeed();
+  } else {
     script.src = url;
     script.async = true;
     script.setAttribute(HANDTALK_SCRIPT_ATTRIBUTE, "true");
-    script.addEventListener("load", () => resolve(), { once: true });
-    script.addEventListener("error", () => reject(new Error("The Hand Talk SDK could not be loaded.")), { once: true });
     document.head.append(script);
-  });
-  const promise = sdkLoadPromise;
-  void promise.catch(() => {
-    document.querySelector<HTMLScriptElement>(`script[${HANDTALK_SCRIPT_ATTRIBUTE}]`)?.remove();
-    sdkLoadPromise = null;
-    loadedSdkUrl = null;
-  });
+  }
+
   return promise;
 }
 
-async function waitForApplicationState(
+export async function waitForApplicationState(
   api: HandTalkApi,
   accepted: readonly string[],
-  timeoutMs = READY_TIMEOUT_MS,
+  options: {
+    timeoutMs?: number;
+    timeoutMessage?: string;
+    signal?: AbortSignal;
+    acceptCurrent?: boolean;
+    eventGate?: () => boolean;
+  } = {},
 ): Promise<string> {
-  const current = normalizedApplicationState(api.getApplicationState());
-  if (accepted.includes(current)) return current;
+  const timeoutMs = options.timeoutMs ?? READY_TIMEOUT_MS;
+  throwIfAvatarOperationCancelled(options.signal);
+  if (options.acceptCurrent !== false) {
+    const current = normalizedApplicationState(api.getApplicationState());
+    if (accepted.includes(current)) return current;
+  }
 
   return new Promise((resolve, reject) => {
     let settled = false;
     let unsubscribe = (): void => undefined;
-    let timer: number | undefined;
+    let timer: ReturnType<typeof globalThis.setTimeout> | undefined;
+    const cleanup = (): void => {
+      if (timer !== undefined) globalThis.clearTimeout(timer);
+      options.signal?.removeEventListener("abort", handleAbort);
+      unsubscribe();
+    };
     const finish = (next: string): void => {
       if (settled) return;
       settled = true;
-      if (timer !== undefined) window.clearTimeout(timer);
-      unsubscribe();
+      cleanup();
       resolve(next);
     };
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    function handleAbort(): void {
+      fail(new AvatarOperationCancelledError());
+    }
     const subscribedUnsubscribe = api.onApplicationStateChange((applicationState) => {
       const next = normalizedApplicationState(applicationState);
-      if (accepted.includes(next)) finish(next);
+      if (accepted.includes(next) && (options.eventGate?.() ?? true)) finish(next);
     });
     unsubscribe = subscribedUnsubscribe;
     if (settled) {
       unsubscribe();
       return;
     }
-    const afterSubscription = normalizedApplicationState(api.getApplicationState());
-    if (accepted.includes(afterSubscription)) {
-      finish(afterSubscription);
-      return;
+    if (options.acceptCurrent !== false) {
+      const afterSubscription = normalizedApplicationState(api.getApplicationState());
+      if (accepted.includes(afterSubscription)) {
+        finish(afterSubscription);
+        return;
+      }
     }
     if (settled) return;
-    timer = window.setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      unsubscribe();
-      reject(new Error("The ASL avatar did not become ready in time."));
+    options.signal?.addEventListener("abort", handleAbort, { once: true });
+    if (options.signal?.aborted) {
+      handleAbort();
+      return;
+    }
+    timer = globalThis.setTimeout(() => {
+      fail(new AvatarOperationTimeoutError(
+        options.timeoutMessage
+          ?? "The ASL avatar did not become ready in time. Try again or use captions.",
+      ));
     }, timeoutMs);
   });
+}
+
+export function withAvatarOperationTimeout<T>(
+  operation: PromiseLike<T>,
+  timeoutMs: number,
+  timeoutMessage: string,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return Promise.reject(new RangeError("The avatar operation timeout must be positive."));
+  }
+  if (signal?.aborted) return Promise.reject(new AvatarOperationCancelledError());
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const cleanup = (): void => {
+      globalThis.clearTimeout(timer);
+      signal?.removeEventListener("abort", handleAbort);
+    };
+    const succeed = (value: T): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const fail = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    function handleAbort(): void {
+      fail(new AvatarOperationCancelledError());
+    }
+    const timer = globalThis.setTimeout(() => fail(new AvatarOperationTimeoutError(timeoutMessage)), timeoutMs);
+    signal?.addEventListener("abort", handleAbort, { once: true });
+    if (signal?.aborted) {
+      handleAbort();
+      return;
+    }
+    void Promise.resolve(operation).then(succeed, fail);
+  });
+}
+
+export function createAvatarOperationCoordinator(): AvatarOperationCoordinator {
+  let current: { controller: AbortController; ticket: AvatarOperationTicket } | null = null;
+
+  return {
+    begin(): AvatarOperationTicket {
+      current?.controller.abort();
+      const controller = new AbortController();
+      const ticket: AvatarOperationTicket = {
+        signal: controller.signal,
+        isCurrent: () => current?.ticket === ticket && !controller.signal.aborted,
+        commit(effect): boolean {
+          if (!ticket.isCurrent()) return false;
+          effect();
+          return true;
+        },
+      };
+      current = { controller, ticket };
+      return ticket;
+    },
+    cancel(): void {
+      current?.controller.abort();
+      current = null;
+    },
+    complete(ticket): void {
+      if (current?.ticket === ticket) current = null;
+    },
+    hasCurrent: () => current !== null,
+  };
+}
+
+async function awaitWithAvatarCancellation<T>(
+  operation: PromiseLike<T> | null,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!operation) throw new Error("The ASL avatar could not be initialized.");
+  throwIfAvatarOperationCancelled(signal);
+  if (!signal) return operation;
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const cleanup = (): void => signal.removeEventListener("abort", handleAbort);
+    const succeed = (value: T): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const fail = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    function handleAbort(): void {
+      fail(new AvatarOperationCancelledError());
+    }
+    signal.addEventListener("abort", handleAbort, { once: true });
+    if (signal.aborted) {
+      handleAbort();
+      return;
+    }
+    void Promise.resolve(operation).then(succeed, fail);
+  });
+}
+
+function throwIfAvatarOperationCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new AvatarOperationCancelledError();
+}
+
+function isActiveApplicationState(value: HandTalkApplicationState): boolean {
+  const state = normalizedApplicationState(value);
+  return state === "translating" || state === "paused";
+}
+
+async function stopProviderMotion(api: HandTalkApi, signal?: AbortSignal): Promise<void> {
+  try {
+    await withAvatarOperationTimeout(
+      api.stop(),
+      STOP_TIMEOUT_MS,
+      "The avatar could not stop the previous message in time. Use captions and try again.",
+      signal,
+    );
+    await waitForApplicationState(api, ["ready", "minimized"], {
+      timeoutMs: STOP_TIMEOUT_MS,
+      timeoutMessage: "The avatar did not return to ready in time. Use captions and try again.",
+      ...(signal ? { signal } : {}),
+    });
+  } catch (error: unknown) {
+    if (error instanceof AvatarOperationCancelledError) throw error;
+    if (error instanceof Error && error.message.includes("in time")) throw error;
+    throw new Error("The avatar could not stop the previous message. Use captions and try again.");
+  }
 }
 
 function normalizedApplicationState(value: HandTalkApplicationState): string {

@@ -763,6 +763,18 @@ test("avatar mode requires activation and per-message confirmation before provid
   await expect(page.getByText("Experimental ASL avatar ready")).toBeVisible();
   expect(configRequests).toBe(1);
   expect(sdk.requestCount()).toBe(1);
+  expect(await page.evaluate(() => {
+    const config = (window as unknown as {
+      handTalkConstructorConfig?: { enableComponents?: Record<string, boolean> };
+    }).handTalkConstructorConfig;
+    return config?.enableComponents;
+  })).toMatchObject({
+    changeSpeedButton: false,
+    pauseAnimationButton: false,
+    rateAnimationButton: false,
+    repeatAnimationButton: false,
+    stopAnimationButton: false,
+  });
 
   const message = "The blue umbrella is waiting beside the chair.";
   await page.getByRole("button", { name: "Type English message" }).click();
@@ -812,7 +824,8 @@ test("avatar mode requires activation and per-message confirmation before provid
   }
   await expect(page.locator(".video-caption p")).toHaveText(message);
   await expect(page.getByText("English caption · final")).toBeVisible();
-  await expect(page.getByText(/Staff confirmed this message/i)).toBeVisible();
+  await expect(page.getByText(/The experimental avatar started/i)).toBeVisible();
+  await expect(page.locator(".state-badge")).toContainText("ASL + caption");
   await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
   await expect(page.getByLabel("Avatar speed")).toHaveValue("normal");
   await expect(page.getByLabel("Avatar speed").locator("option")).toHaveText(["Slow", "Standard", "Fast"]);

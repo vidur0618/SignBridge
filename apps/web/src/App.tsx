@@ -27,7 +27,11 @@ import {
   transcribeAudio,
   type SessionInfo,
 } from "./api.js";
-import { HandTalkAvatar, type HandTalkAvatarHandle } from "./avatar/HandTalkAvatar.js";
+import {
+  HandTalkAvatar,
+  type AvatarExecutionEvent,
+  type HandTalkAvatarHandle,
+} from "./avatar/HandTalkAvatar.js";
 import { classifyDemoTranscript, DEMO_CATALOG, DEMO_TRANSCRIPT, getIntent, validateAudioFile } from "./demo.js";
 import { LiveTranscriptionSocket } from "./liveTranscription.js";
 import { PcmMicrophone } from "./microphone.js";
@@ -48,7 +52,7 @@ import type {
 } from "./models.js";
 
 type ConnectionState = "idle" | "connecting" | "connected" | "offline";
-type ProcessState = "idle" | "preparing" | "listening" | "finalizing" | "classifying" | "caption_ready" | "candidate" | "avatar_confirmation" | "fallback" | "playing";
+type ProcessState = "idle" | "preparing" | "listening" | "finalizing" | "classifying" | "caption_ready" | "candidate" | "avatar_confirmation" | "avatar_starting" | "fallback" | "playing";
 
 const INPUT_TABS: Array<{ id: InputMethod; label: string; detail: string }> = [
   { id: "speak", label: "Speak", detail: "Push to talk" },
@@ -294,14 +298,19 @@ export function App(): ReactNode {
 
   const handleAvatarStateChange = useCallback((next: AvatarPlaybackState) => {
     setAvatarState(next);
+  }, []);
+
+  const handleAvatarExecutionEvent = useCallback((event: AvatarExecutionEvent) => {
     const execution = avatarExecutionRef.current;
-    if (!execution) return;
+    if (!execution || execution.authorizationId !== event.requestId) return;
     const latencyMs = Math.min(
       120_000,
       Math.max(0, Math.round(performance.now() - execution.authorizedAt)),
     );
-    if (next === "translating" && !execution.started) {
+    if (event.result === "started" && !execution.started) {
       execution.started = true;
+      setProcessState("playing");
+      setNotice("The experimental avatar started. Keep the finalized English caption visible while it signs.");
       void reportAvatarExecution({
         authorizationId: execution.authorizationId,
         result: "started",
@@ -309,7 +318,7 @@ export function App(): ReactNode {
       }).catch(() => undefined);
       return;
     }
-    if (next === "ready" && execution.started && !execution.terminal) {
+    if (event.result === "completed" && execution.started && !execution.terminal) {
       execution.terminal = true;
       void reportAvatarExecution({
         authorizationId: execution.authorizationId,
@@ -318,14 +327,16 @@ export function App(): ReactNode {
       }).catch(() => undefined);
       return;
     }
-    if (next === "error" && !execution.terminal) {
+    if (event.result === "failed" && !execution.terminal) {
       execution.terminal = true;
       void reportAvatarExecution({
         authorizationId: execution.authorizationId,
         result: "failed",
         latencyMs,
       }).catch(() => undefined);
+      return;
     }
+    if (event.result === "canceled") execution.terminal = true;
   }, []);
 
   const applyCandidate = useCallback((next: IntentCandidate, transcriptOverride?: string) => {
@@ -807,7 +818,7 @@ export function App(): ReactNode {
       );
     }
     setCandidate(null);
-    if (finalCaption || processState === "candidate" || processState === "avatar_confirmation" || processState === "playing") {
+    if (finalCaption || processState === "candidate" || processState === "avatar_confirmation" || processState === "avatar_starting" || processState === "playing") {
       setFallbackReason(nextMode === "captions_only" ? "captions_only_selected" : "staff_rejected");
       setProcessState("fallback");
     }
@@ -897,8 +908,8 @@ export function App(): ReactNode {
         terminal: false,
       };
       setAvatarRequest({ id: authorization.authorizationId, text: authorization.text });
-      setProcessState("playing");
-      setNotice("Staff confirmed this message. The finalized caption remains visible while the experimental avatar signs.");
+      setProcessState("avatar_starting");
+      setNotice("Staff confirmed this message. Waiting for verified avatar motion; the finalized English caption remains visible.");
     } catch (authorizationError) {
       if (generation !== workGenerationRef.current) return;
       setPendingAvatarMessage(null);
@@ -944,6 +955,7 @@ export function App(): ReactNode {
     || processState === "listening"
     || processState === "finalizing"
     || processState === "classifying"
+    || processState === "avatar_starting"
     || uploading
     || deciding;
 
@@ -1089,7 +1101,7 @@ export function App(): ReactNode {
                     <p className="step-label">Step 1</p>
                     <h2 id="input-heading">Create the message</h2>
                   </div>
-                  {processState === "caption_ready" || processState === "candidate" || processState === "avatar_confirmation" || processState === "fallback" || processState === "playing" ? <button className="text-button" type="button" onClick={resetUtterance}>Clear</button> : null}
+                  {processState === "caption_ready" || processState === "candidate" || processState === "avatar_confirmation" || processState === "avatar_starting" || processState === "fallback" || processState === "playing" ? <button className="text-button" type="button" onClick={resetUtterance}>Clear</button> : null}
                 </div>
 
                 <div className="input-tabs" aria-label="Message input method">
@@ -1157,10 +1169,8 @@ export function App(): ReactNode {
                     request={avatarRequest}
                     caption={finalCaption}
                     state={avatarState}
-                    onStateChange={(next) => {
-                      handleAvatarStateChange(next);
-                      if (next === "translating") setProcessState("playing");
-                    }}
+                    onStateChange={handleAvatarStateChange}
+                    onExecutionEvent={handleAvatarExecutionEvent}
                     onError={(message) => {
                       setAvatarRequest(null);
                       setError(message);
@@ -1558,6 +1568,7 @@ const AvatarStage = forwardRef<HandTalkAvatarHandle, {
   caption: string;
   state: AvatarPlaybackState;
   onStateChange: (state: AvatarPlaybackState) => void;
+  onExecutionEvent: (event: AvatarExecutionEvent) => void;
   onError: (message: string) => void;
 }>(function AvatarStage(props, ref): ReactNode {
   const handle = (): HandTalkAvatarHandle | null =>
@@ -1575,6 +1586,7 @@ const AvatarStage = forwardRef<HandTalkAvatarHandle, {
         request={props.request}
         caption={props.caption}
         onStateChange={props.onStateChange}
+        onExecutionEvent={props.onExecutionEvent}
         onError={props.onError}
       />
       {!props.request ? (
@@ -1707,7 +1719,7 @@ function MetricCard({ label, value, detail, icon }: { label: string; value: stri
 }
 
 function StateBadge({ state }: { state: ProcessState }): ReactNode {
-  const labels: Record<ProcessState, string> = { idle: "Ready", preparing: "Preparing", listening: "Listening", finalizing: "Finalizing", classifying: "Checking phrase", caption_ready: "Caption ready", candidate: "Staff review", avatar_confirmation: "Avatar confirmation", fallback: "Safe fallback", playing: "ASL + caption" };
+  const labels: Record<ProcessState, string> = { idle: "Ready", preparing: "Preparing", listening: "Listening", finalizing: "Finalizing", classifying: "Checking phrase", caption_ready: "Caption ready", candidate: "Staff review", avatar_confirmation: "Avatar confirmation", avatar_starting: "Starting avatar", fallback: "Safe fallback", playing: "ASL + caption" };
   return <span className={`state-badge ${state}`}><span />{labels[state]}</span>;
 }
 
